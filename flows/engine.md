@@ -48,3 +48,10 @@ Live video needs WebCodecs = https or localhost. On the Pi: `tailscale serve --b
   renders in `/root/noswipe-videos/out` > 24 h, Remotion/Chrome temp files in `/tmp` > 6 h; if the disk passes 85%,
   renders > 2 h.
 - Secrets: `config.toml` (Gmail app password) is gitignored; copy `config.example.toml` to start.
+
+## Sync with the render server (Tailscale)
+Every `[sync].every_min` (10) minutes the engine, over SSH to `[sync].host` (studio@100.102.103.115 = render-vm):
+- pushes consistent copies of `stats.db`, `research.db`, `engine.db` to `~/feedback/` (the nightly session reads them),
+- pulls finished plans from `~/outbox/<name>/` into `mailbox/inbox/<name>/` (staged in `mailbox/incoming/` first) and
+  deletes them on the server. The server writes `~/outbox/.<name>.part/` and renames it when complete.
+The engine starts both directions; the server never needs access to the engine machine.

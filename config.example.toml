@@ -10,6 +10,10 @@ port = 8080
 [mailbox]
 inbox = "mailbox/inbox"            # one folder per day: plan.json + videos/ (later synced from S3)
 
+[sync]   # render server over Tailscale: feedback goes up, finished plans come down
+host = "studio@100.102.103.115"
+every_min = 10
+
 [schedule]
 # stats snapshots after each post, in minutes: 1h 3h 6h 12h 24h 48h
 stats_offsets_min = [60, 180, 360, 720, 1440, 2880]

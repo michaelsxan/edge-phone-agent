@@ -157,6 +157,54 @@ def import_plans() -> None:
             con.commit()
 
 
+# ================================================================ sync with the render server (over Tailscale)
+_last_sync = 0.0
+
+
+def sync() -> None:
+    """Every [sync].every_min minutes (engine-initiated, so the server never needs access to this machine):
+    - push consistent copies of stats.db / research.db / engine.db to <host>:feedback/ (what the nightly session reads)
+    - pull finished plans from <host>:outbox/<name>/ (plan.json + videos/) into the inbox, deleting them on the
+      server once copied. A plan is staged in mailbox/incoming/ and only moved into the inbox when fully copied.
+    The server writes a plan as outbox/.<name>.part/ and renames it to outbox/<name>/ when complete."""
+    global _last_sync
+    s = CFG.get("sync")
+    if not s or not s.get("host") or time.time() - _last_sync < s.get("every_min", 10) * 60:
+        return
+    _last_sync = time.time()
+    import shutil
+    import subprocess
+    host = s["host"]
+    ssh = "ssh -o BatchMode=yes -o ConnectTimeout=15"
+    stage = ROOT / "mailbox" / "feedback"
+    stage.mkdir(parents=True, exist_ok=True)
+    for name in ("stats.db", "research.db", "engine.db"):
+        src = ROOT / name
+        if src.exists():
+            with sqlite3.connect(src) as a, sqlite3.connect(stage / name) as b:
+                a.backup(b)  # consistent snapshot even while jobs write
+    r = subprocess.run(["rsync", "-az", "-e", ssh, f"{stage}/", f"{host}:feedback/"], capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        alert("sync", f"could not push feedback to {host}: {r.stderr.strip()[:200]}")
+        return
+    ls = subprocess.run(ssh.split() + [host, "ls -1 outbox 2>/dev/null"], capture_output=True, text=True, timeout=60)
+    for name in [n for n in ls.stdout.split() if not n.startswith(".")]:
+        incoming = ROOT / "mailbox" / "incoming" / name
+        incoming.parent.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(["rsync", "-az", "--remove-source-files", "-e", ssh, f"{host}:outbox/{name}/", f"{incoming}/"],
+                           capture_output=True, text=True, timeout=3600)
+        if r.returncode != 0 or not (incoming / "plan.json").exists():
+            alert("sync", f"could not pull plan {name} from {host}: {r.stderr.strip()[:200]}")
+            continue
+        subprocess.run(ssh.split() + [host, f"rm -rf outbox/{name}"], capture_output=True, timeout=60)
+        target = INBOX / name
+        if target.exists():
+            alert("sync", f"plan {name} already in the inbox: kept the new copy in mailbox/incoming/{name}", every_min=0)
+            continue
+        shutil.move(str(incoming), str(target))
+        print(f"sync: pulled plan {name}", flush=True)
+
+
 # ================================================================ disk clean-up
 _last_cleanup = 0.0
 
@@ -393,6 +441,10 @@ class Runner:
     async def loop(self) -> None:
         while True:
             try:
+                try:
+                    await asyncio.to_thread(sync)
+                except Exception as ex:
+                    alert("sync", f"sync failed: {ex!r}")
                 import_plans()
                 cleanup()
                 if not self.paused and self.job is None:
