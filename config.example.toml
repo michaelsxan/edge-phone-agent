@@ -13,6 +13,8 @@ inbox = "mailbox/inbox"            # one folder per day: plan.json + videos/ (la
 [sync]   # render server over Tailscale: feedback goes up, finished plans come down
 host = "studio@100.102.103.115"
 every_min = 10
+expect_plans = false   # true once nightly runs are live: warns when no plan arrived by plan_deadline
+plan_deadline = "11:00"
 
 [schedule]
 # stats snapshots after each post, in minutes: 1h 3h 6h 12h 24h 48h

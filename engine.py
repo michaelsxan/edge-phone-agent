@@ -211,6 +211,27 @@ def sync() -> None:
         print(f"sync: pulled plan {name}", flush=True)
 
 
+# ================================================================ missing-plan warning
+def check_plan_arrived() -> None:
+    """If the nightly session failed (crash, usage limit, server down), no plan arrives and the engine would quietly
+    do nothing. From [sync].plan_deadline (default 11:00, local time) warn once a day when today has no plan."""
+    s = CFG.get("sync")
+    if not s or not s.get("host") or not s.get("expect_plans"):  # off until nightly runs go live
+        return
+    now = datetime.now()
+    deadline = s.get("plan_deadline", "11:00")
+    if now.strftime("%H:%M") < deadline:
+        return
+    today = now.strftime("%Y-%m-%d")
+    if get_state("plan_warned") == today:
+        return
+    if db().execute("select 1 from plans where day=?", (today,)).fetchone():
+        return
+    set_state("plan_warned", today)
+    alert("plan", f"no plan for {today} arrived by {deadline}: the nightly run on the render server probably failed "
+                  f"(check ~/nightly/runs/{today}/run.log on {s['host']}). Nothing will be posted today.", every_min=0)
+
+
 # ================================================================ disk clean-up
 _last_cleanup = 0.0
 
@@ -452,6 +473,7 @@ class Runner:
                 except Exception as ex:
                     alert("sync", f"sync failed: {ex!r}")
                 import_plans()
+                check_plan_arrived()
                 cleanup()
                 if not self.paused and self.job is None:
                     job, minutes = self.pick(time.time())
