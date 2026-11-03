@@ -433,6 +433,7 @@ class Runner:
             fh.write(f"\n=== attempt {attempts} at {datetime.now():%Y-%m-%d %H:%M:%S}: {' '.join(cmd[1:])}\n")
             self.proc = await asyncio.create_subprocess_exec(*cmd, cwd=ROOT, env=env, stdout=asyncio.subprocess.PIPE,
                                                              stderr=asyncio.subprocess.STDOUT, start_new_session=True)
+            set_state("job_pgid", self.proc.pid)  # so a restarted engine can stop an orphaned job
 
             async def pump():
                 nonlocal result, aborted
@@ -454,6 +455,7 @@ class Runner:
                 await self.proc.wait()
                 rc, aborted = -9, f"timed out after {timeout / 60:.0f} min"
         self.proc = None
+        set_state("job_pgid", None)
         ended = time.time()
         shots = sorted((p for p in (ROOT / "runs").glob("fail-*.png") if p.stat().st_mtime >= started), key=lambda p: p.stat().st_mtime)
         shot = shots[-1].name if shots else None
@@ -711,6 +713,14 @@ def main() -> None:
     LOGS.mkdir(exist_ok=True)
     INBOX.mkdir(parents=True, exist_ok=True)
     db()
+    pgid = get_state("job_pgid")  # the engine died mid-job: its job process may still be driving the phone
+    if pgid:
+        try:
+            os.killpg(int(pgid), signal.SIGKILL)
+            print(f"stopped an orphaned job process group {pgid}", flush=True)
+        except (ProcessLookupError, PermissionError):
+            pass
+        set_state("job_pgid", None)
     con = db()  # a job left "running" by a crash: retry it, except a post (it may already be out: never post twice)
     for j in con.execute("select * from jobs where status='running'").fetchall():
         if j["kind"] == "post":
