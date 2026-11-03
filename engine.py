@@ -183,6 +183,12 @@ def sync() -> None:
         if src.exists():
             with sqlite3.connect(src) as a, sqlite3.connect(stage / name) as b:
                 a.backup(b)  # consistent snapshot even while jobs write
+    # which accounts exist and their daily limits (no secrets), so the nightly session plans within capacity
+    (stage / "accounts.json").write_text(json.dumps(
+        {"accounts": [{"app": app, "account": name, **lim} for app, accts in CFG.get("accounts", {}).items()
+                      for name, lim in accts.items()],
+         "stats_offsets_min": SCHED["stats_offsets_min"], "rounds": [12, 16, 20],
+         "written_at": datetime.now().isoformat(timespec="seconds")}, indent=1))
     r = subprocess.run(["rsync", "-az", "-e", ssh, f"{stage}/", f"{host}:feedback/"], capture_output=True, text=True, timeout=300)
     if r.returncode != 0:
         alert("sync", f"could not push feedback to {host}: {r.stderr.strip()[:200]}")

@@ -24,18 +24,22 @@ max_attempts = 2
 
 # Accounts already logged in on the phone. Daily limits are per account.
 [accounts.tiktok.nomoreawkwardness]
+use = "practice"           # tests only; never in nightly plans
 posts_per_day = 3
 likes_per_day = 20
 comments_per_day = 5
 research_minutes_per_day = 60
 
 [accounts.instagram.nomoreawkwardness]
+use = "practice"           # tests only; never in nightly plans
 posts_per_day = 3
 likes_per_day = 20
 comments_per_day = 5
 research_minutes_per_day = 60
 
 [accounts.instagram.tinyloveshows]   # noswipe: silent story seasons
+use = "noswipe"
+about = "silent story seasons (Tiny Love Shows)"
 posts_per_day = 4
 likes_per_day = 20
 comments_per_day = 5
