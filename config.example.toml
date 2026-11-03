@@ -58,3 +58,6 @@ from = "wegotit713@gmail.com"
 smtp_host = "smtp.gmail.com"
 smtp_port = 465
 app_password = ""            # your Gmail app password (never commit it)
+
+[instagram]
+meta_ai_audio = "off"   # "off" = Turn off and share, "allow" = Share; unset = refuse and alert

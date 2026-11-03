@@ -16,19 +16,29 @@ import argparse
 import re
 import sys
 import time
+import tomllib
 from datetime import date
 from pathlib import Path
 
 from phone import SERIAL, Abort, Phone
 
 PKG = "com.instagram.android"
+CFG = tomllib.loads((Path(__file__).parent / "config.toml").read_text())
 AUDIENCE = {"everyone": "Everyone", "close_friends": "Close Friends"}
 POPUPS = ("No, thanks", "Not now", "Not Now", "Remind me later")  # dismiss buttons for nag dialogs
+
+
+PROMO_SHEETS = ("Stand out with a verified badge", "Meta One", "Meta Verified")  # paid-upsell sheets: close, never tap
 
 
 def dismiss_popups(p: Phone) -> None:
     for _ in range(3):
         ns = p.nodes()
+        if any(n["label"].startswith(PROMO_SHEETS) for n in ns):
+            print("  closing a promo sheet with Back (never its button)", flush=True)
+            p.d.press("back")
+            time.sleep(1.5)
+            continue
         hit = next((n for n in ns if n["label"] in POPUPS and n.get("clickable") == "true"), None)
         if hit is None:
             return
@@ -63,7 +73,12 @@ def open_profile_reels(p: Phone) -> None:
     """Profile tab, then the Reels tab of the profile grid (tapped once: a second tap opens a sort menu)."""
     p.wake()
     dismiss_popups(p)
-    p.tap_node(p.by_id("profile_tab"), "Profile tab")
+    tab = p.by_id("profile_tab")
+    if tab is None:  # a sheet may cover the tab bar
+        dismiss_popups(p)
+        time.sleep(1)
+        tab = p.by_id("profile_tab")
+    p.tap_node(tab, "Profile tab")
     p.wait("profile", "Profile", timeout=20)
     tabs = None
     for _ in range(10):  # the grid's tab row renders a moment after the header
@@ -82,7 +97,14 @@ def open_profile_reels(p: Phone) -> None:
         time.sleep(1)
 
 
+def keyboard_open(p: Phone) -> bool:
+    return any(n.get("resource-id", "").endswith(("key_pos_space", "input_method_nav_back")) or n["label"] == "Space"
+               for n in p.nodes())
+
+
 def scroll(p: Phone, down: bool = True) -> None:
+    if keyboard_open(p):
+        p.fail("refusing to scroll while the keyboard is open (the swipe would type into the caption)")
     a, b = ("1300", "500") if down else ("500", "1300")
     p.adb("shell", "input", "swipe", "360", a, "360", b, "350")
     time.sleep(1.5)
@@ -98,7 +120,7 @@ def upload(video: Path, caption: str, audience: str, delete_after: bool) -> None
         _upload(p, remote, caption, audience, delete_after, today)
     except Abort:
         try:
-            if p.find("Share") or p.find("Edit video") or p.find("Start over"):
+            if p.find("Share") or p.find("Edit video") or p.find("Start over") or p.find("Save draft"):
                 discard_session(p)
         except Abort:
             pass
@@ -123,6 +145,19 @@ def _upload(p: Phone, remote: str, caption: str, audience: str, delete_after: bo
             p.d.app_start(PKG, stop=True)
             p.wait("home screen", "Home", timeout=30)
             p.tap_node(p.by_id("action_bar_left_button"), "Create (+) again")
+
+    # Since 2026-11-03 "+" can open on the POST tab ("New post"), and the new INSTANTS tab pushes REEL off the
+    # right edge of the tab strip: select the REEL tab by its id (uiautomator taps its visible part).
+    end = time.time() + 10
+    while time.time() < end and not p.find("New reel"):
+        if p.find("New post") or p.by_id("cam_dest_feed"):
+            reel_tab = p.d(resourceId=f"{PKG}:id/cam_dest_clips")
+            if reel_tab.exists:
+                print("  '+' opened on New post: switching to the REEL tab", flush=True)
+                reel_tab.click()
+                time.sleep(3)
+                continue
+        time.sleep(1)
 
     print("3. New reel gallery -> newest video", flush=True)
     p.wait("New reel gallery", "New reel", "REEL")
@@ -151,17 +186,24 @@ def _upload(p: Phone, remote: str, caption: str, audience: str, delete_after: bo
     p.tap_node(p.by_id("clips_right_action_button"), "Next")
 
     print("5. share screen", flush=True)
-    ns = p.wait("share screen", "New reel", "Share", "Save draft", timeout=30)
+    ns = p.wait("share screen", "New reel", "Save draft", timeout=30)  # its share button may say "Share" or "Next"
     p.tap_node(p.by_id("caption_input_text_view", ns), "caption field")
     p.d(resourceId=f"{PKG}:id/caption_input_text_view").clear_text()
     time.sleep(0.5)
     p.type_text(caption)
-    ok = p.find("OK", clickable=True)
-    if ok:
-        p.tap_node(ok, "OK (commit caption)")
-    else:
+    # commit the caption: a "Done" check mark (since 2026-11-03) or an "OK" button; then make sure the keyboard is
+    # gone, because the scroll below is a swipe and on the keyboard it would gesture-type letters into the caption
+    done = p.find("Done") or p.find("OK", clickable=True)
+    if done:
+        p.tap_node(done, f"{done['label']} (commit caption)")
+        time.sleep(1.5)
+    for _ in range(2):
+        if not keyboard_open(p):
+            break
         p.d.press("back")
-        time.sleep(1)
+        time.sleep(1.5)
+    if keyboard_open(p):
+        p.fail("the keyboard would not close after the caption")
     field = p.by_id("caption_input_text_view")
     if field is None or field.get("text") != caption:
         p.fail(f"caption field shows {field and field.get('text')!r}, expected {caption!r}")
@@ -193,6 +235,22 @@ def _upload(p: Phone, remote: str, caption: str, audience: str, delete_after: bo
 
     print(f"6. SHARE  (audience: {want}, caption: {caption!r})", flush=True)
     p.tap_node(p.by_id("share_button"), "Share")
+    # One-time notice (2026-11-03): "Update on your original audio ... can be used by people on the Meta AI app".
+    # Its buttons both share. Which one is the account owner's choice: [instagram].meta_ai_audio = "off" | "allow".
+    end = time.time() + 8
+    while time.time() < end:
+        if p.find("Turn off and share"):
+            choice = (CFG.get("instagram") or {}).get("meta_ai_audio")
+            if choice == "off":
+                p.tap_node(p.find("Turn off and share"), "Turn off and share (Meta AI audio off)")
+            elif choice == "allow":
+                p.tap_node(p.by_id("clips_original_audio_nux_sheet_share_button"), "Share (Meta AI audio allowed)")
+            else:
+                p.tap_node(p.find("Dismiss"), "dismiss the Meta AI audio notice")
+                p.fail("Instagram asks whether Meta AI may reuse our original audio; set [instagram] meta_ai_audio "
+                       "= \"off\" or \"allow\" in config.toml (nothing was shared)")
+            break
+        time.sleep(1)
 
     print("7. confirm it on the profile's Reels tab", flush=True)
     time.sleep(20)  # let the upload finish; never restart the app here, it could cut the upload off

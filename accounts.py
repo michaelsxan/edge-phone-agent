@@ -147,7 +147,11 @@ def tt_switch(p: Phone, handle: str) -> None:
 def ig_setup_screens(p: Phone) -> None:
     """One-off screens after a new login ("Set up on new device": contacts, etc.): always Skip, never Allow."""
     for _ in range(4):
-        if p.find("Set up on new device") or p.find("Allow access to contacts to find people to follow"):
+        if any(p.find(t) for t in ("Stand out with a verified badge", "Meta One", "Meta Verified")):
+            print("  closing a promo sheet with Back (never its button)", flush=True)  # paid upsell: never tap it
+            p.d.press("back")
+            time.sleep(1.5)
+        elif p.find("Set up on new device") or p.find("Allow access to contacts to find people to follow"):
             skip = p.find("Skip", clickable=None) or p.find("Not now")
             if skip is None:
                 p.fail("new-device setup screen without a Skip button")
