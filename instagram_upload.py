@@ -1,0 +1,254 @@
+"""Upload one video as an Instagram Reel on the phone, end to end, checking every screen before tapping.
+
+Steps (see flows/instagram_upload.md): copy to gallery -> Home "+" -> New reel gallery -> newest video
+(must be dated today) -> editor Next -> share screen (caption, audience, all toggles off) -> Share ->
+confirm it is at the top of the Home feed. Facebook, Your story, AI label, Save draft, location and
+tag-people are never touched; if any toggle is on, the run aborts instead of guessing.
+
+Usage:
+  python instagram_upload.py VIDEO.mp4 --caption "text" --audience everyone
+  python instagram_upload.py VIDEO.mp4 --caption "test" --audience close_friends --delete-after   # test mode
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+import time
+from datetime import date
+from pathlib import Path
+
+from phone import SERIAL, Abort, Phone
+
+PKG = "com.instagram.android"
+AUDIENCE = {"everyone": "Everyone", "close_friends": "Close Friends"}
+POPUPS = ("No, thanks", "Not now", "Not Now", "Remind me later")  # dismiss buttons for nag dialogs
+
+
+def dismiss_popups(p: Phone) -> None:
+    for _ in range(3):
+        ns = p.nodes()
+        hit = next((n for n in ns if n["label"] in POPUPS and n.get("clickable") == "true"), None)
+        if hit is None:
+            return
+        p.tap_node(hit, f"dismiss '{hit['label']}'")
+
+
+def discard_unfinished(p: Phone) -> None:
+    """If a half-finished reel from an earlier aborted run is waiting, throw it away (never save it as a draft)."""
+    if not p.find("Keep editing your draft?"):
+        return
+    p.tap_node(p.find("Keep editing", clickable=True), "Keep editing (to reach the discard option)")
+    time.sleep(3)
+    discard_session(p)
+
+
+def discard_session(p: Phone) -> None:
+    """Back out of an unfinished reel (share screen or editor) and choose Start over, never Save draft."""
+    for _ in range(4):
+        start_over = p.find("Start over")
+        if start_over:
+            p.tap_node(start_over, "Start over (discard)")
+            time.sleep(2)
+            return
+        if p.find("New reel") and p.find("REEL"):  # back in the empty gallery: nothing to discard
+            return
+        p.d.press("back")
+        time.sleep(2)
+    p.fail("could not reach 'Start over' to discard the unfinished reel")
+
+
+def open_profile_reels(p: Phone) -> None:
+    """Profile tab, then the Reels tab of the profile grid (tapped once: a second tap opens a sort menu)."""
+    p.wake()
+    dismiss_popups(p)
+    p.tap_node(p.by_id("profile_tab"), "Profile tab")
+    p.wait("profile", "Profile", timeout=20)
+    tabs = None
+    for _ in range(10):  # the grid's tab row renders a moment after the header
+        tabs = p.by_id("profile_tab_layout")
+        if tabs:
+            break
+        time.sleep(1.5)
+        p.wake()
+    if tabs is None:
+        p.fail("profile tabs not found")
+    x1, y1, x2, y2 = tabs["box"]
+    p.tap(x1 + (x2 - x1) * 3 // 8, (y1 + y2) // 2, "profile Reels tab")
+    time.sleep(2)
+    if p.find("Most viewed"):  # the tab was already selected; tapping again opened its sort menu
+        p.d.press("back")
+        time.sleep(1)
+
+
+def scroll(p: Phone, down: bool = True) -> None:
+    a, b = ("1300", "500") if down else ("500", "1300")
+    p.adb("shell", "input", "swipe", "360", a, "360", b, "350")
+    time.sleep(1.5)
+
+
+def upload(video: Path, caption: str, audience: str, delete_after: bool) -> None:
+    p = Phone(SERIAL)
+    today = f"{date.today():%B} {date.today().day}, {date.today().year}"  # e.g. "November 2, 2026"
+
+    print("1. copy video to the gallery", flush=True)
+    remote = p.push_video(video)
+    try:
+        _upload(p, remote, caption, audience, delete_after, today)
+    except Abort:
+        try:
+            if p.find("Share") or p.find("Edit video") or p.find("Start over"):
+                discard_session(p)
+        except Abort:
+            pass
+        raise
+    finally:
+        p.remove_video(remote)
+        print("  removed the copied video from the phone", flush=True)
+
+
+def _upload(p: Phone, remote: str, caption: str, audience: str, delete_after: bool, today: str) -> None:
+
+    print("2. open Instagram -> Create", flush=True)
+    p.wake()
+    p.d.app_start(PKG, stop=True)
+    p.wait("home screen", "Home", "Reels", "Profile", timeout=30)
+    dismiss_popups(p)
+    p.tap_node(p.by_id("action_bar_left_button"), "Create (+)")
+    time.sleep(2)
+    if p.find("Keep editing your draft?"):
+        discard_unfinished(p)
+        if not p.find("New reel"):  # "Start over" usually lands back in the gallery already
+            p.d.app_start(PKG, stop=True)
+            p.wait("home screen", "Home", timeout=30)
+            p.tap_node(p.by_id("action_bar_left_button"), "Create (+) again")
+
+    print("3. New reel gallery -> newest video", flush=True)
+    p.wait("New reel gallery", "New reel", "REEL")
+    tiles: list[dict] = []
+    end = time.time() + 20  # thumbnails load a few seconds after the gallery opens
+    while time.time() < end and not tiles:
+        tiles = sorted((n for n in p.nodes() if n["label"].startswith("Unselected Video thumbnail")),
+                       key=lambda n: (n["box"][1], n["box"][0]))
+        if not tiles:
+            time.sleep(1.5)
+    if not tiles:
+        p.fail("no video tiles in the gallery")
+    if today not in tiles[0]["label"]:
+        p.fail(f"newest video tile is not from today ({tiles[0]['label'][:80]!r})")
+    time.sleep(2)  # tiles are listed a moment before they accept taps
+    for attempt in range(2):
+        p.tap_node(tiles[0], "newest video")
+        end = time.time() + 12
+        while time.time() < end and not p.find("Edit video"):
+            time.sleep(1)
+        if p.find("Edit video"):
+            break
+
+    print("4. editor -> Next", flush=True)
+    p.wait("reel editor", "Next", "Edit video", timeout=20)
+    p.tap_node(p.by_id("clips_right_action_button"), "Next")
+
+    print("5. share screen", flush=True)
+    ns = p.wait("share screen", "New reel", "Share", "Save draft", timeout=30)
+    p.tap_node(p.by_id("caption_input_text_view", ns), "caption field")
+    p.d(resourceId=f"{PKG}:id/caption_input_text_view").clear_text()
+    time.sleep(0.5)
+    p.type_text(caption)
+    ok = p.find("OK", clickable=True)
+    if ok:
+        p.tap_node(ok, "OK (commit caption)")
+    else:
+        p.d.press("back")
+        time.sleep(1)
+    field = p.by_id("caption_input_text_view")
+    if field is None or field.get("text") != caption:
+        p.fail(f"caption field shows {field and field.get('text')!r}, expected {caption!r}")
+
+    scroll(p)
+    want = AUDIENCE[audience]
+    ns = p.wait("share screen settings", "Audience", "Facebook", "Your story")
+    current = next((n["label"] for n in ns if n.get("resource-id", "").endswith(":id/inline_subtitle")), "")
+    if current != want:
+        p.tap_node(p.find("Audience", ns), "Audience row")
+        ns = p.wait("audience screen", "Who can see your reel", want)
+        row = p.find(want, ns)
+        # the radio button sits at the right end of the row
+        p.tap(660, row["center"][1], f"audience '{want}' radio")
+        ok = p.find("OK", clickable=True)
+        if ok:
+            p.tap_node(ok, "OK (audience info)")
+        p.d.press("back")
+        time.sleep(1.5)
+        ns = p.wait("share screen settings", "Audience", "Facebook")
+        current = next((n["label"] for n in ns if n.get("resource-id", "").endswith(":id/inline_subtitle")), "")
+        if current != want:
+            p.fail(f"audience did not stick (shows {current!r})")
+
+    xml = p.d.dump_hierarchy()
+    toggles_on = re.findall(r'checkable="true" checked="true"', xml)
+    if toggles_on:
+        p.fail(f"{len(toggles_on)} toggle(s) are on (Facebook / Your story / AI label); refusing to share")
+
+    print(f"6. SHARE  (audience: {want}, caption: {caption!r})", flush=True)
+    p.tap_node(p.by_id("share_button"), "Share")
+
+    print("7. confirm it on the profile's Reels tab", flush=True)
+    time.sleep(20)  # let the upload finish; never restart the app here, it could cut the upload off
+    open_profile_reels(p)
+    tile = None
+    end = time.time() + 180
+    while time.time() < end:
+        tile = p.find(re.compile(r"^Reel by .+\. View Count 0\."))
+        if tile is not None:
+            break
+        time.sleep(10)
+        p.wake()
+        if p.find("Most viewed"):  # sort menu got opened; close it
+            p.d.press("back")
+            time.sleep(1)
+        p.adb("shell", "input", "swipe", "360", "400", "360", "1200", "300")  # pull to refresh
+        time.sleep(4)
+    if tile is None:
+        p.fail("no new (0-view) reel on the profile after 3 minutes")
+    p.tap_node(tile, "newest reel")
+    ns = p.wait("reel viewer", "More", timeout=20)
+    if not p.find(re.compile(re.escape(caption[:25])), ns):
+        p.fail("the newest reel's caption does not match")
+    print("  OK: reel found with the right caption", flush=True)
+
+    if delete_after:
+        print("8. delete the test reel", flush=True)
+        p.tap_node(p.find("More", ns), "reel menu")
+        ns = p.wait("reel menu", "Delete")
+        p.tap_node(next(n for n in ns if n["label"] == "Delete"), "Delete")
+        p.wait("delete confirm", "Delete reel?")
+        p.tap_node(p.by_id("igds_alert_dialog_primary_button"), "Delete (confirm)")
+        time.sleep(3)
+        print("  deleted", flush=True)
+
+    print("done", flush=True)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("video", type=Path)
+    ap.add_argument("--caption", required=True)
+    ap.add_argument("--audience", choices=AUDIENCE, default="everyone")
+    ap.add_argument("--account", help="switch to this already-logged-in account first")
+    ap.add_argument("--delete-after", action="store_true", help="for tests: delete the reel once verified")
+    a = ap.parse_args()
+    try:
+        if a.account:
+            import accounts
+            p = Phone(SERIAL)
+            accounts.switch(p, "instagram", a.account)
+        upload(a.video, a.caption, a.audience, a.delete_after)
+    except Abort as e:
+        print(f"ABORTED: {e}", flush=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

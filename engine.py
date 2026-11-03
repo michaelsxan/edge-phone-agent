@@ -1,0 +1,609 @@
+"""Content engine box: runs the day's plan on the phone, one job at a time, and serves the dashboard.
+
+  uv run python engine.py            -> dashboard on http://127.0.0.1:8080
+
+Plans arrive as mailbox/inbox/<name>/plan.json (+ videos/). Each plan is imported once into engine.db as jobs:
+  post      one per post x app/account, at a random minute of its round hour (12/16/20) or at an exact "at"
+  stats     added after a post succeeds, at the configured offsets (1h 3h 6h 12h 24h 48h)
+  research  fills the gaps between fixed jobs, inside its time window, within daily limits
+  delete    clean-up of test posts
+Each job runs the matching script (tiktok_upload.py, instagram_upload.py, stats.py, research.py, delete.py) as
+a subprocess; its output goes to logs/<id>.log. Failures retry once, then raise an alert (dashboard + email).
+Take over pauses the runner: research/stats are stopped at once, a post or delete is allowed to finish first.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import random
+import re
+import signal
+import smtplib
+import sqlite3
+import sys
+import time
+import tomllib
+from datetime import datetime, timedelta
+from email.message import EmailMessage
+from pathlib import Path
+
+from aiohttp import WSMsgType, web
+
+from scrcpy_bridge import Mirror
+
+ROOT = Path(__file__).parent
+CFG = tomllib.loads((ROOT / "config.toml").read_text())
+SERIAL = CFG["phone"]["serial"]
+DB = ROOT / "engine.db"
+LOGS = ROOT / "logs"
+INBOX = ROOT / CFG["mailbox"]["inbox"]
+SCHED = CFG["schedule"]
+FIXED = ("post", "delete", "stats")  # jobs with a set time; research fills the gaps
+TIMEOUT_MIN = {"post": 15, "delete": 8, "stats": 10}
+PUBLISH_TAP = re.compile(r"tap (Post|Share) at")  # once seen, a failed post must not be retried blindly
+
+
+# ================================================================ database
+def db() -> sqlite3.Connection:
+    con = sqlite3.connect(DB, timeout=10)
+    con.row_factory = sqlite3.Row
+    con.executescript("""
+    create table if not exists jobs (
+      id integer primary key, plan text, kind text, app text, account text, run_at real, not_after real,
+      args text, status text default 'waiting', attempts integer default 0, started_at real, ended_at real,
+      result text, error text, shot text, post_key text, label text, created_at real);
+    create table if not exists plans (name text primary key, day text, imported_at real);
+    create table if not exists alerts (id integer primary key, at real, kind text, text text, emailed integer default 0,
+      seen integer default 0);
+    create table if not exists state (k text primary key, v text);
+    """)
+    return con
+
+
+def get_state(k: str, default=None):
+    row = db().execute("select v from state where k=?", (k,)).fetchone()
+    return json.loads(row["v"]) if row else default
+
+
+def set_state(k: str, v) -> None:
+    con = db()
+    con.execute("insert into state (k, v) values (?, ?) on conflict(k) do update set v=excluded.v", (k, json.dumps(v)))
+    con.commit()
+
+
+def add_job(con, **f) -> int:
+    f.setdefault("created_at", time.time())
+    if isinstance(f.get("args"), dict):
+        f["args"] = json.dumps(f["args"])
+    cur = con.execute(f"insert into jobs ({', '.join(f)}) values ({', '.join('?' * len(f))})", tuple(f.values()))
+    return cur.lastrowid
+
+
+# ================================================================ alerts
+_last_alert: dict[str, float] = {}
+
+
+def alert(kind: str, text: str, every_min: float = 30) -> None:
+    """Record an alert; email it to yourself if an app password is configured. Same kind at most every N min."""
+    now = time.time()
+    if now - _last_alert.get(kind, 0) < every_min * 60:
+        return
+    _last_alert[kind] = now
+    print(f"ALERT [{kind}] {text}", flush=True)
+    emailed = 0
+    e = CFG.get("email", {})
+    if e.get("app_password"):
+        try:
+            m = EmailMessage()
+            m["Subject"] = f"[content engine] {kind}: {text[:80]}"
+            m["From"], m["To"] = e["from"], e["to"]
+            m.set_content(f"{text}\n\n{datetime.now():%Y-%m-%d %H:%M}\nDashboard: http://{CFG['dashboard']['host']}:{CFG['dashboard']['port']}")
+            with smtplib.SMTP_SSL(e["smtp_host"], e["smtp_port"], timeout=20) as s:
+                s.login(e["from"], e["app_password"])
+                s.send_message(m)
+            emailed = 1
+        except Exception as ex:  # never let alerting break the runner
+            print(f"  email failed: {ex}", flush=True)
+    con = db()
+    con.execute("insert into alerts (at, kind, text, emailed) values (?,?,?,?)", (now, kind, text, emailed))
+    con.commit()
+
+
+# ================================================================ plans -> jobs
+def at_time(day: str, hhmm: str) -> float:
+    return datetime.strptime(f"{day} {hhmm}", "%Y-%m-%d %H:%M").timestamp()
+
+
+def import_plans() -> None:
+    con = db()
+    for f in sorted(INBOX.glob("*/plan.json")):
+        name = f.parent.name
+        if con.execute("select 1 from plans where name=?", (name,)).fetchone():
+            continue
+        try:
+            plan = json.loads(f.read_text())
+            day = plan["day"]
+            for post in plan.get("posts", []):
+                for t in post["targets"]:
+                    if t.get("at") or post.get("at"):
+                        run_at = at_time(day, t.get("at") or post["at"])
+                    else:  # a random minute (and second) of the round's hour
+                        run_at = at_time(day, f"{int(post['round']):02d}:00") + random.randrange(0, 3600)
+                    args = {"video": str((f.parent / post["video"]).resolve()), "caption": post["caption"],
+                            "stats_offsets_min": plan.get("stats_offsets_min")}
+                    if t["app"] == "tiktok":
+                        args["visibility"] = t.get("visibility", "everyone")
+                    else:
+                        args["audience"] = t.get("audience", "everyone")
+                    add_job(con, plan=name, kind="post", app=t["app"], account=t["account"], run_at=run_at,
+                            args=args, post_key=f"{name}/{post['id']}/{t['app']}", label=post["id"])
+            for r in plan.get("research", []):
+                add_job(con, plan=name, kind="research", app=r["app"], account=r["account"],
+                        run_at=at_time(day, r.get("not_before", "09:00")), not_after=at_time(day, r.get("not_after", "23:00")),
+                        args={k: r[k] for k in ("keyword", "minutes", "max_likes", "max_comments") if k in r},
+                        label=r["keyword"])
+            for d in plan.get("deletes", []):
+                add_job(con, plan=name, kind="delete", app=d["app"], account=d["account"], run_at=at_time(day, d["at"]),
+                        args={"caption": d["caption"]}, label="clean-up")
+            con.execute("insert into plans (name, day, imported_at) values (?,?,?)", (name, day, time.time()))
+            con.commit()
+            print(f"imported plan {name}", flush=True)
+        except Exception as ex:
+            con.rollback()
+            alert("plan", f"could not import {name}: {ex}", every_min=0)
+            con.execute("insert into plans (name, day, imported_at) values (?,?,?)", (name, "?", time.time()))
+            con.commit()
+
+
+# ================================================================ disk clean-up
+_last_cleanup = 0.0
+
+
+def cleanup() -> None:
+    """Keep the disk from filling up (runs at most once an hour):
+    - a plan's videos are deleted as soon as none of its posts is waiting or running (they are on the phone's
+      accounts by then; captions stay in engine.db for stats),
+    - job logs older than 30 days and failure screenshots older than 14 days are deleted."""
+    global _last_cleanup
+    if time.time() - _last_cleanup < 3600:
+        return
+    _last_cleanup = time.time()
+    con = db()
+    freed = 0
+    for videos in INBOX.glob("*/videos"):
+        pending = con.execute("select count(*) from jobs where plan=? and kind='post' and status in ('waiting','running')",
+                              (videos.parent.name,)).fetchone()[0]
+        imported = con.execute("select 1 from plans where name=?", (videos.parent.name,)).fetchone()
+        if imported and not pending:
+            for f in videos.glob("*"):
+                freed += f.stat().st_size
+                f.unlink()
+    now = time.time()
+    for folder, days in ((LOGS, 30), (ROOT / "runs", 14)):
+        for f in folder.glob("*"):
+            if f.is_file() and now - f.stat().st_mtime > days * 86400 and f.name != "engine.out":
+                freed += f.stat().st_size
+                f.unlink()
+    if freed:
+        print(f"clean-up: freed {freed / 1e6:.0f} MB", flush=True)
+
+
+# ================================================================ limits
+def acct_cfg(app: str, account: str) -> dict:
+    return CFG.get("accounts", {}).get(app, {}).get(account, {})
+
+
+def used_today(app: str, account: str) -> dict:
+    today = datetime.now().strftime("%Y-%m-%d")
+    out = {"likes": 0, "comments": 0, "posts": 0, "research_minutes": 0.0}
+    rdb = ROOT / "research.db"
+    if rdb.exists():
+        rc = sqlite3.connect(rdb)
+        cols = [r[1] for r in rc.execute("pragma table_info(videos)")]
+        if "account" in cols:
+            row = rc.execute("select coalesce(sum(liked),0), count(commented) from videos where app=? and account=? "
+                             "and seen_at like ?", (app, account, today + "%")).fetchone()
+            out["likes"], out["comments"] = row
+    start = datetime.strptime(today, "%Y-%m-%d").timestamp()
+    con = db()
+    out["posts"] = con.execute("select count(*) from jobs where kind='post' and app=? and account=? and status in "
+                               "('done','unverified') and started_at>=?", (app, account, start)).fetchone()[0]
+    out["research_minutes"] = con.execute("select coalesce(sum(ended_at-started_at),0)/60.0 from jobs where kind='research' "
+                                          "and app=? and account=? and started_at>=? and ended_at is not null",
+                                          (app, account, start)).fetchone()[0]
+    return out
+
+
+# ================================================================ runner
+class Runner:
+    def __init__(self):
+        self.proc: asyncio.subprocess.Process | None = None
+        self.job: sqlite3.Row | None = None
+        self.tail: list[str] = []
+        self.interrupted = False
+        self.phone_ok = None
+
+    @property
+    def paused(self) -> bool:
+        return bool(get_state("paused", False))
+
+    async def adb(self, *args: str, timeout: float = 15) -> str:
+        try:
+            p = await asyncio.create_subprocess_exec("adb", *args, stdout=asyncio.subprocess.PIPE,
+                                                     stderr=asyncio.subprocess.STDOUT)
+            out, _ = await asyncio.wait_for(p.communicate(), timeout)
+            return out.decode(errors="replace").strip()
+        except Exception as ex:
+            return f"error {ex}"
+
+    async def check_phone(self) -> bool:
+        ok = await self.adb("-s", SERIAL, "get-state") == "device"
+        if not ok and ":" in SERIAL:
+            await self.adb("connect", SERIAL)
+            ok = await self.adb("-s", SERIAL, "get-state") == "device"
+        self.phone_ok = ok
+        if not ok:
+            alert("phone", f"phone {SERIAL} is not connected over adb")
+        return ok
+
+    def pick(self, now: float):
+        """Next job to run now, or None. Fixed jobs first (posts > deletes > stats), then research in a gap."""
+        con = db()
+        job = con.execute("select * from jobs where status='waiting' and kind in ('post','delete','stats') and run_at<=? "
+                          "order by case kind when 'post' then 0 when 'delete' then 1 else 2 end, run_at limit 1",
+                          (now,)).fetchone()
+        if job:
+            return job, None
+        nxt = con.execute("select min(run_at) from jobs where status='waiting' and kind in ('post','delete','stats')").fetchone()[0]
+        for r in con.execute("select * from jobs where status='waiting' and kind='research' and run_at<=? order by run_at", (now,)):
+            if r["not_after"] and now > r["not_after"]:
+                self.finish(r["id"], "skipped", error="its time window passed")
+                continue
+            a = json.loads(r["args"])
+            lim, used = acct_cfg(r["app"], r["account"]), used_today(r["app"], r["account"])
+            minutes = min(float(a.get("minutes", 10)),
+                          (r["not_after"] - now) / 60 if r["not_after"] else 1e9,
+                          (nxt - now) / 60 - SCHED["research_margin_min"] if nxt else 1e9,
+                          lim.get("research_minutes_per_day", 60) - used["research_minutes"])
+            if minutes >= 2:
+                return r, round(minutes, 1)
+        return None, None
+
+    def finish(self, job_id: int, status: str, **f) -> None:
+        con = db()
+        f["status"] = status
+        con.execute(f"update jobs set {', '.join(k + '=?' for k in f)} where id=?", (*f.values(), job_id))
+        con.commit()
+
+    def command(self, job, minutes: float | None) -> list[str]:
+        a = json.loads(job["args"])
+        py = sys.executable
+        app, acct = job["app"], job["account"]
+        if job["kind"] == "post":
+            if app == "tiktok":
+                return [py, "tiktok_upload.py", a["video"], "--caption", a["caption"], "--visibility", a["visibility"], "--account", acct]
+            return [py, "instagram_upload.py", a["video"], "--caption", a["caption"], "--audience", a["audience"], "--account", acct]
+        if job["kind"] == "stats":
+            cmd = [py, "stats.py", app, a["caption"], "--account", acct, "--label", job["label"]]
+            if app == "tiktok" and a.get("offset_min", 0) >= SCHED["tiktok_detailed_from_min"]:
+                cmd.append("--detailed")
+            return cmd
+        if job["kind"] == "research":
+            lim, used = acct_cfg(app, acct), used_today(app, acct)
+            likes = max(0, min(int(a.get("max_likes", 3)), lim.get("likes_per_day", 20) - used["likes"]))
+            comments = max(0, min(int(a.get("max_comments", 1)), lim.get("comments_per_day", 5) - used["comments"]))
+            return [py, "research.py", app, a["keyword"], "--minutes", str(minutes), "--max-likes", str(likes),
+                    "--max-comments", str(comments), "--account", acct]
+        if job["kind"] == "delete":
+            return [py, "delete.py", app, a["caption"], "--account", acct]
+        raise ValueError(job["kind"])
+
+    async def run(self, job, minutes: float | None) -> None:
+        if job["kind"] == "post":
+            lim, used = acct_cfg(job["app"], job["account"]), used_today(job["app"], job["account"])
+            if used["posts"] >= lim.get("posts_per_day", 3):
+                self.finish(job["id"], "skipped", error=f"daily post limit reached for {job['account']}")
+                return
+        self.job, self.tail, self.interrupted = job, [], False
+        started = time.time()
+        attempts = job["attempts"] + 1
+        self.finish(job["id"], "running", started_at=started, attempts=attempts, error=None)
+        cmd = self.command(job, minutes)
+        log = LOGS / f"{job['id']}.log"
+        timeout = (minutes + 8 if job["kind"] == "research" else TIMEOUT_MIN[job["kind"]]) * 60
+        env = {**os.environ, "PHONE_SERIAL": SERIAL, "PYTHONUNBUFFERED": "1"}
+        result, aborted = None, None
+        with log.open("a") as fh:
+            fh.write(f"\n=== attempt {attempts} at {datetime.now():%Y-%m-%d %H:%M:%S}: {' '.join(cmd[1:])}\n")
+            self.proc = await asyncio.create_subprocess_exec(*cmd, cwd=ROOT, env=env, stdout=asyncio.subprocess.PIPE,
+                                                             stderr=asyncio.subprocess.STDOUT, start_new_session=True)
+
+            async def pump():
+                nonlocal result, aborted
+                async for raw in self.proc.stdout:
+                    line = raw.decode(errors="replace").rstrip()
+                    fh.write(line + "\n")
+                    fh.flush()
+                    self.tail = (self.tail + [line])[-300:]
+                    if line.startswith("RESULT "):
+                        result = line[7:]
+                    elif line.startswith("ABORTED:"):
+                        aborted = line[8:].strip()
+
+            try:
+                await asyncio.wait_for(pump(), timeout)
+                rc = await self.proc.wait()
+            except asyncio.TimeoutError:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+                await self.proc.wait()
+                rc, aborted = -9, f"timed out after {timeout / 60:.0f} min"
+        self.proc = None
+        ended = time.time()
+        shots = sorted((p for p in (ROOT / "runs").glob("fail-*.png") if p.stat().st_mtime >= started), key=lambda p: p.stat().st_mtime)
+        shot = shots[-1].name if shots else None
+        log_text = "\n".join(self.tail)
+        self.job = None
+
+        if self.interrupted:  # taken over mid-job
+            if job["kind"] == "research":
+                self.finish(job["id"], "done", ended_at=ended, result=result, error="stopped early (taken over)")
+            else:
+                self.finish(job["id"], "waiting", ended_at=ended, attempts=attempts - 1, error="interrupted (taken over)")
+            return
+        if rc == 0:
+            self.finish(job["id"], "done", ended_at=ended, result=result, shot=shot)
+            if job["kind"] == "post":
+                self.schedule_stats(job, ended)
+            return
+        err = aborted or f"exit code {rc}"
+        if job["kind"] == "post" and PUBLISH_TAP.search(log_text):
+            # It may have gone out: never post twice. Stats will tell whether it exists.
+            self.finish(job["id"], "unverified", ended_at=ended, error=f"published but not verified: {err}", shot=shot)
+            self.schedule_stats(job, ended)
+            alert("post", f"{job['app']} @{job['account']} '{job['label']}': published but not verified ({err}). Check the profile.", every_min=0)
+            return
+        if attempts < SCHED["max_attempts"] and job["kind"] != "research":
+            self.finish(job["id"], "waiting", ended_at=ended, error=err, shot=shot,
+                        run_at=time.time() + SCHED["retry_after_min"] * 60)
+        else:
+            self.finish(job["id"], "failed", ended_at=ended, error=err, shot=shot)
+            alert("job", f"{job['kind']} {job['app']} @{job['account']} '{job['label']}' failed: {err}", every_min=0)
+
+    def schedule_stats(self, job, posted_at: float) -> None:
+        a = json.loads(job["args"])
+        con = db()
+        for off in a.get("stats_offsets_min") or SCHED["stats_offsets_min"]:
+            label = f"{off // 60}h" if off % 60 == 0 else f"{off}m"
+            add_job(con, plan=job["plan"], kind="stats", app=job["app"], account=job["account"],
+                    run_at=posted_at + off * 60, args={"caption": a["caption"], "offset_min": off},
+                    post_key=job["post_key"], label=label)
+        con.commit()
+
+    async def take_over(self) -> None:
+        set_state("paused", True)
+        if self.proc and self.job and self.job["kind"] in ("research", "stats"):
+            self.interrupted = True
+            try:
+                os.killpg(self.proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+    async def loop(self) -> None:
+        while True:
+            try:
+                import_plans()
+                cleanup()
+                if not self.paused and self.job is None:
+                    job, minutes = self.pick(time.time())
+                    if job is not None and await self.check_phone():
+                        await self.run(job, minutes)
+                        continue
+                elif self.job is None and int(time.time()) % 60 < 5:
+                    await self.check_phone()
+            except Exception as ex:
+                alert("engine", f"runner error: {ex!r}")
+                self.job = None
+            await asyncio.sleep(5)
+
+
+RUNNER = Runner()
+MIRROR = Mirror(SERIAL)
+
+
+# ================================================================ web
+def rows(cur) -> list[dict]:
+    return [dict(r) for r in cur]
+
+
+async def page(_req):
+    return web.FileResponse(ROOT / "web" / "dashboard.html")
+
+
+async def api_state(_req):
+    con = db()
+    now = time.time()
+    start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    jobs = rows(con.execute("select * from jobs where run_at>=? - 3600*6 or status in ('waiting','running') "
+                            "order by run_at", (start,)))
+    for j in jobs:
+        j["args"] = json.loads(j["args"] or "{}")
+    accounts = []
+    for app, accts in CFG.get("accounts", {}).items():
+        for name, lim in accts.items():
+            accounts.append({"app": app, "account": name, "limits": lim, "used": used_today(app, name)})
+    return web.json_response({
+        "now": now,
+        "paused": RUNNER.paused,
+        "pausing": RUNNER.paused and RUNNER.job is not None,
+        "phone_ok": RUNNER.phone_ok,
+        "running": dict(RUNNER.job) if RUNNER.job else None,
+        "tail": RUNNER.tail[-40:],
+        "jobs": jobs,
+        "alerts": rows(con.execute("select * from alerts order by at desc limit 30")),
+        "accounts": accounts,
+        "mirror_error": MIRROR.error,
+    })
+
+
+async def api_takeover(_req):
+    await RUNNER.take_over()
+    return web.json_response({"ok": True})
+
+
+async def api_resume(_req):
+    set_state("paused", False)
+    return web.json_response({"ok": True})
+
+
+async def api_job_action(req):
+    jid, action = int(req.match_info["id"]), req.match_info["action"]
+    con = db()
+    job = con.execute("select * from jobs where id=?", (jid,)).fetchone()
+    if job is None or job["status"] == "running":
+        return web.json_response({"ok": False, "error": "no such job or it is running"}, status=400)
+    if action == "skip":
+        con.execute("update jobs set status='skipped', error='skipped by you' where id=?", (jid,))
+    elif action in ("retry", "now"):
+        con.execute("update jobs set status='waiting', run_at=?, error=null where id=?", (time.time(), jid))
+    con.commit()
+    return web.json_response({"ok": True})
+
+
+async def api_log(req):
+    f = LOGS / f"{int(req.match_info['id'])}.log"
+    return web.Response(text=f.read_text() if f.exists() else "(no log yet)")
+
+
+async def api_alerts_seen(_req):
+    con = db()
+    con.execute("update alerts set seen=1")
+    con.commit()
+    return web.json_response({"ok": True})
+
+
+async def api_results(_req):
+    posts = []
+    sdb = ROOT / "stats.db"
+    snaps = {}
+    if sdb.exists():
+        sc = sqlite3.connect(sdb)
+        sc.row_factory = sqlite3.Row
+        cols = [r[1] for r in sc.execute("pragma table_info(snapshots)")]
+        if "label" in cols:
+            for r in sc.execute("select * from snapshots where label is not null order by taken_at"):
+                snaps.setdefault((r["app"], r["account"], r["caption"]), []).append(
+                    {"label": r["label"], "taken_at": r["taken_at"], "data": json.loads(r["data"])})
+    con = db()
+    for j in con.execute("select * from jobs where kind='post' and status in ('done','unverified') order by started_at desc limit 60"):
+        a = json.loads(j["args"])
+        posts.append({"id": j["id"], "app": j["app"], "account": j["account"], "label": j["label"], "caption": a["caption"],
+                      "posted_at": j["ended_at"], "status": j["status"],
+                      "snapshots": snaps.get((j["app"], j["account"], a["caption"]), [])})
+    research = []
+    rdb = ROOT / "research.db"
+    if rdb.exists():
+        rc = sqlite3.connect(rdb)
+        rc.row_factory = sqlite3.Row
+        cols = [r[1] for r in rc.execute("pragma table_info(videos)")]
+        sel = "commented, account" if "commented" in cols else "null as commented, null as account"
+        research = rows(rc.execute(f"select id, app, keyword, seen_at, creator, caption, likes, comments, relevant, liked, {sel} "
+                                   "from videos order by id desc limit 80"))
+    return web.json_response({"posts": posts, "research": research})
+
+
+async def shot(req):
+    f = ROOT / "runs" / Path(req.match_info["name"]).name
+    if not f.exists():
+        raise web.HTTPNotFound()
+    return web.FileResponse(f)
+
+
+async def screen_png(_req):
+    """Fallback for browsers without WebCodecs (e.g. plain http over Tailscale): one screenshot."""
+    p = await asyncio.create_subprocess_exec("adb", "-s", SERIAL, "exec-out", "screencap", "-p", stdout=asyncio.subprocess.PIPE)
+    out, _ = await asyncio.wait_for(p.communicate(), 15)
+    return web.Response(body=out, content_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+async def screen_input(req):
+    """Fallback input (adb), only while taken over."""
+    if not RUNNER.paused:
+        return web.json_response({"ok": False, "error": "take over first"}, status=409)
+    m = await req.json()
+    if m["t"] == "tap":
+        await RUNNER.adb("-s", SERIAL, "shell", "input", "tap", str(int(m["x"])), str(int(m["y"])))
+    elif m["t"] == "swipe":
+        await RUNNER.adb("-s", SERIAL, "shell", "input", "swipe", *(str(int(m[k])) for k in ("x1", "y1", "x2", "y2")), "300")
+    elif m["t"] == "key":
+        from scrcpy_bridge import KEYS
+        await RUNNER.adb("-s", SERIAL, "shell", "input", "keyevent", str(KEYS[m["k"]]))
+    return web.json_response({"ok": True})
+
+
+async def ws_screen(req):
+    ws = web.WebSocketResponse(max_msg_size=1 << 20)
+    await ws.prepare(req)
+    try:
+        await MIRROR.add(ws)
+    except Exception as ex:
+        await ws.send_str(json.dumps({"error": str(ex)}))
+        await MIRROR.remove(ws)
+        await ws.close()
+        return ws
+    try:
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT:
+                m = json.loads(msg.data)
+                if RUNNER.paused:  # the phone is yours only while taken over
+                    await MIRROR.handle(m)
+    finally:
+        await MIRROR.remove(ws)
+    return ws
+
+
+async def on_start(app):
+    app["runner"] = asyncio.create_task(RUNNER.loop())
+
+
+async def on_stop(app):
+    app["runner"].cancel()
+    await MIRROR.stop()
+
+
+def main() -> None:
+    LOGS.mkdir(exist_ok=True)
+    INBOX.mkdir(parents=True, exist_ok=True)
+    db()
+    con = db()  # a job left "running" by a crash: retry it, except a post (it may already be out: never post twice)
+    for j in con.execute("select * from jobs where status='running'").fetchall():
+        if j["kind"] == "post":
+            con.execute("update jobs set status='unverified', error='engine restarted mid-post: check the profile' where id=?", (j["id"],))
+            alert("post", f"engine restarted during a post ({j['app']} @{j['account']} '{j['label']}'): check the profile", every_min=0)
+        else:
+            con.execute("update jobs set status='waiting', error='engine restarted mid-job' where id=?", (j["id"],))
+    con.commit()
+    app = web.Application()
+    app.add_routes([
+        web.get("/", page),
+        web.get("/api/state", api_state),
+        web.get("/api/results", api_results),
+        web.post("/api/takeover", api_takeover),
+        web.post("/api/resume", api_resume),
+        web.post("/api/job/{id}/{action:retry|skip|now}", api_job_action),
+        web.get("/api/job/{id}/log", api_log),
+        web.post("/api/alerts/seen", api_alerts_seen),
+        web.get("/shots/{name}", shot),
+        web.get("/api/screen.png", screen_png),
+        web.post("/api/input", screen_input),
+        web.get("/ws/screen", ws_screen),
+    ])
+    app.on_startup.append(on_start)
+    app.on_cleanup.append(on_stop)
+    web.run_app(app, host=CFG["dashboard"]["host"], port=CFG["dashboard"]["port"], print=lambda *_: print(
+        f"dashboard: http://{CFG['dashboard']['host']}:{CFG['dashboard']['port']}", flush=True))
+
+
+if __name__ == "__main__":
+    main()

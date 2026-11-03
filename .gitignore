@@ -1,0 +1,14 @@
+# secrets: config.toml holds the Gmail app password -> see config.example.toml
+config.toml
+# runtime data
+*.db
+logs/
+runs/
+mailbox/
+diag/
+__pycache__/
+.venv/
+# phone screen maps and the viewer built from them (screenshots of logged-in accounts)
+maps/
+maps-run.log
+viewer/

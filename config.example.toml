@@ -1,0 +1,47 @@
+# Content engine (noswipe.app) — box settings
+
+[phone]
+serial = "192.168.1.150:5555"     # later on the Pi: the USB serial (see `adb devices`)
+
+[dashboard]
+host = "127.0.0.1"                 # on the Pi: keep 127.0.0.1 and expose it with `tailscale serve --bg 8080` (HTTPS)
+port = 8080
+
+[mailbox]
+inbox = "mailbox/inbox"            # one folder per day: plan.json + videos/ (later synced from S3)
+
+[schedule]
+# stats snapshots after each post, in minutes: 1h 3h 6h 12h 24h 48h
+stats_offsets_min = [60, 180, 360, 720, 1440, 2880]
+tiktok_detailed_from_min = 1440    # TikTok Post analysis refreshes daily: only read it from the 24h snapshot on
+research_margin_min = 4            # keep this much free before the next fixed job (posts, stats)
+retry_after_min = 5
+max_attempts = 2
+
+# Accounts already logged in on the phone. Daily limits are per account.
+[accounts.tiktok.nomoreawkwardness]
+posts_per_day = 3
+likes_per_day = 20
+comments_per_day = 5
+research_minutes_per_day = 60
+
+[accounts.instagram.nomoreawkwardness]
+posts_per_day = 3
+likes_per_day = 20
+comments_per_day = 5
+research_minutes_per_day = 60
+
+[accounts.instagram.tinyloveshows]   # noswipe: silent story seasons
+posts_per_day = 4
+likes_per_day = 20
+comments_per_day = 5
+research_minutes_per_day = 60
+
+# Email alerts to yourself. Fill in a Gmail app password (https://myaccount.google.com/apppasswords) to turn on;
+# while it is empty, alerts only show on the dashboard.
+[email]
+to = "olxzulfar@gmail.com"
+from = "wegotit713@gmail.com"
+smtp_host = "smtp.gmail.com"
+smtp_port = 465
+app_password = ""            # your Gmail app password (never commit it)
