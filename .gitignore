@@ -12,3 +12,4 @@ __pycache__/
 maps/
 maps-run.log
 viewer/
+.engine.lock

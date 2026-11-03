@@ -130,7 +130,7 @@ $("#tabs").onclick = e => {
 };
 
 // ---------------------------------------------------------------- state
-const KIND = {post: "Post", stats: "Stats", research: "Research", delete: "Delete"};
+const KIND = {post: "Post", stats: "Stats", research: "Research", delete: "Delete", preflight: "Preflight"};
 function what(j) {
   const a = j.args || {};
   if (j.kind === "post") return `<b>${esc(j.label)}</b> <span class="muted cap">${esc((a.caption||"").slice(0, 60))}</span>` +
@@ -138,6 +138,7 @@ function what(j) {
   if (j.kind === "stats") return `${esc(j.label)} snapshot · <span class="muted">${esc((a.caption||"").slice(0, 50))}</span>`;
   if (j.kind === "research") return `“${esc(a.keyword)}” · ${a.minutes} min` + (j.not_after ? ` <span class="muted">until ${hm(j.not_after)}</span>` : "");
   if (j.kind === "delete") return `delete <span class="muted">${esc((a.caption||"").slice(0, 50))}</span>`;
+  if (j.kind === "preflight") return `morning checks: phone, accounts, disks, render server, today's plan`;
   return "";
 }
 function render() {
@@ -173,7 +174,7 @@ function render() {
       return `<tr>
         <td>${dayhm(t)}${late ? ' <span class="err">late</span>' : ""}</td>
         <td>${KIND[j.kind] || j.kind}</td>
-        <td>${j.app === "tiktok" ? "TikTok" : "IG"} @${esc(j.account)}</td>
+        <td>${j.app === "-" ? "—" : (j.app === "tiktok" ? "TikTok" : "IG") + " @" + esc(j.account)}</td>
         <td>${what(j)}${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}${j.shot ? ` <a href="/shots/${esc(j.shot)}" target="_blank">screenshot</a>` : ""}</td>
         <td><span class="st ${j.status}">${j.status}</span>${j.attempts > 1 ? ` <span class="muted">×${j.attempts}</span>` : ""}</td>
         <td class="row-actions">

@@ -31,6 +31,7 @@ from pathlib import Path
 
 from aiohttp import WSMsgType, web
 
+from plan_check import caption_key, check_plan
 from scrcpy_bridge import Mirror
 
 ROOT = Path(__file__).parent
@@ -40,8 +41,8 @@ DB = ROOT / "engine.db"
 LOGS = ROOT / "logs"
 INBOX = ROOT / CFG["mailbox"]["inbox"]
 SCHED = CFG["schedule"]
-FIXED = ("post", "delete", "stats")  # jobs with a set time; research fills the gaps
-TIMEOUT_MIN = {"post": 15, "delete": 8, "stats": 10}
+FIXED = ("preflight", "post", "delete", "stats")  # jobs with a set time; research fills the gaps
+TIMEOUT_MIN = {"post": 15, "delete": 8, "stats": 10, "preflight": 15}
 PUBLISH_TAP = re.compile(r"tap (Post|Share) at")  # once seen, a failed post must not be retried blindly
 
 
@@ -123,7 +124,23 @@ def import_plans() -> None:
         if con.execute("select 1 from plans where name=?", (name,)).fetchone():
             continue
         try:
-            plan = json.loads(f.read_text())
+            raw = json.loads(f.read_text())
+            existing = {caption_key(json.loads(r["args"]).get("caption", ""))
+                        for r in con.execute("select args from jobs where kind='post'")}
+            per_day: dict = {}
+            try:
+                d0 = datetime.strptime(str(raw.get("day")), "%Y-%m-%d").timestamp()
+                for r in con.execute("select app, account, count(*) n from jobs where kind='post' and status not in "
+                                     "('failed','skipped') and run_at>=? and run_at<? group by app, account", (d0, d0 + 86400)):
+                    per_day[(r["app"], r["account"])] = r["n"]
+            except ValueError:
+                pass
+            plan, problems = check_plan(raw, f.parent, CFG, existing, per_day)
+            if problems:
+                alert("plan", f"plan {name}: {'rejected' if plan is None else 'some items dropped'}:\n- " + "\n- ".join(problems),
+                      every_min=0)
+            if plan is None:
+                raise ValueError("plan rejected")
             day = plan["day"]
             for post in plan.get("posts", []):
                 for t in post["targets"]:
@@ -152,7 +169,8 @@ def import_plans() -> None:
             print(f"imported plan {name}", flush=True)
         except Exception as ex:
             con.rollback()
-            alert("plan", f"could not import {name}: {ex}", every_min=0)
+            if str(ex) != "plan rejected":
+                alert("plan", f"could not import {name}: {ex}", every_min=0)
             con.execute("insert into plans (name, day, imported_at) values (?,?,?)", (name, "?", time.time()))
             con.commit()
 
@@ -230,6 +248,25 @@ def check_plan_arrived() -> None:
     set_state("plan_warned", today)
     alert("plan", f"no plan for {today} arrived by {deadline}: the nightly run on the render server probably failed "
                   f"(check ~/nightly/runs/{today}/run.log on {s['host']}). Nothing will be posted today.", every_min=0)
+
+
+# ================================================================ morning preflight
+def schedule_preflight() -> None:
+    """Once a day at [preflight].at (default 09:30, local time) queue a preflight job (phone, accounts, disks,
+    render server, today's plan). It runs like any job: failure -> one retry -> email with every problem found."""
+    pf = CFG.get("preflight", {})
+    if pf.get("enabled", True) is False:
+        return
+    now = datetime.now()
+    if now.strftime("%H:%M") < pf.get("at", "09:30"):
+        return
+    today = now.strftime("%Y-%m-%d")
+    if get_state("preflight_day") == today:
+        return
+    set_state("preflight_day", today)
+    con = db()
+    add_job(con, plan="daily", kind="preflight", app="-", account="-", run_at=time.time(), args={}, label="preflight")
+    con.commit()
 
 
 # ================================================================ disk clean-up
@@ -326,12 +363,12 @@ class Runner:
     def pick(self, now: float):
         """Next job to run now, or None. Fixed jobs first (posts > deletes > stats), then research in a gap."""
         con = db()
-        job = con.execute("select * from jobs where status='waiting' and kind in ('post','delete','stats') and run_at<=? "
-                          "order by case kind when 'post' then 0 when 'delete' then 1 else 2 end, run_at limit 1",
+        job = con.execute("select * from jobs where status='waiting' and kind in ('preflight','post','delete','stats') and run_at<=? "
+                          "order by case kind when 'preflight' then 0 when 'post' then 1 when 'delete' then 2 else 3 end, run_at limit 1",
                           (now,)).fetchone()
         if job:
             return job, None
-        nxt = con.execute("select min(run_at) from jobs where status='waiting' and kind in ('post','delete','stats')").fetchone()[0]
+        nxt = con.execute("select min(run_at) from jobs where status='waiting' and kind in ('preflight','post','delete','stats')").fetchone()[0]
         for r in con.execute("select * from jobs where status='waiting' and kind='research' and run_at<=? order by run_at", (now,)):
             if r["not_after"] and now > r["not_after"]:
                 self.finish(r["id"], "skipped", error="its time window passed")
@@ -373,6 +410,8 @@ class Runner:
                     "--max-comments", str(comments), "--account", acct]
         if job["kind"] == "delete":
             return [py, "delete.py", app, a["caption"], "--account", acct]
+        if job["kind"] == "preflight":
+            return [py, "preflight.py"]
         raise ValueError(job["kind"])
 
     async def run(self, job, minutes: float | None) -> None:
@@ -473,6 +512,7 @@ class Runner:
                 except Exception as ex:
                     alert("sync", f"sync failed: {ex!r}")
                 import_plans()
+                schedule_preflight()
                 check_plan_arrived()
                 cleanup()
                 if not self.paused and self.job is None:
@@ -652,7 +692,22 @@ async def on_stop(app):
     await MIRROR.stop()
 
 
+def single_instance() -> None:
+    """Two engines would run every job twice (double posts). Hold an exclusive lock for the process lifetime."""
+    import fcntl
+    global _LOCK
+    _LOCK = open(ROOT / ".engine.lock", "w")
+    try:
+        fcntl.flock(_LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("another engine is already running here: exiting", flush=True)
+        sys.exit(1)
+    _LOCK.write(str(os.getpid()))
+    _LOCK.flush()
+
+
 def main() -> None:
+    single_instance()
     LOGS.mkdir(exist_ok=True)
     INBOX.mkdir(parents=True, exist_ok=True)
     db()

@@ -16,6 +16,9 @@ every_min = 10
 expect_plans = false   # true once nightly runs are live: warns when no plan arrived by plan_deadline
 plan_deadline = "11:00"
 
+[preflight]   # daily morning checks; problems are emailed hours before the first post
+at = "09:30"
+
 [schedule]
 # stats snapshots after each post, in minutes: 1h 3h 6h 12h 24h 48h
 stats_offsets_min = [60, 180, 360, 720, 1440, 2880]
