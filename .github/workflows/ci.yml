@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: ffmpeg (the plan validator probes videos)
         run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
       - uses: astral-sh/setup-uv@v6
@@ -33,6 +33,6 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: move deploy to this commit (the box picks it up within ~15 min, when no post is near)
         run: git push origin "HEAD:refs/heads/deploy"
