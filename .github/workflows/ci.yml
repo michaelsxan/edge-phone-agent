@@ -34,5 +34,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # git must see that deploy is behind this commit
       - name: move deploy to this commit (the box picks it up within ~15 min, when no post is near)
         run: git push origin "HEAD:refs/heads/deploy"
