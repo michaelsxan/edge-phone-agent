@@ -4,7 +4,7 @@
 serial = "192.168.1.150:5555"     # later on the Pi: the USB serial (see `adb devices`)
 
 [dashboard]
-host = "127.0.0.1"                 # on the Pi: keep 127.0.0.1 and expose it with `tailscale serve --bg 8080` (HTTPS)
+host = "127.0.0.1"                 # local only; remote access goes through [access] below
 port = 8080
 
 [mailbox]
@@ -66,3 +66,9 @@ meta_ai_audio = "off"   # "off" = Turn off and share, "allow" = Share; unset = r
 branch = "deploy"
 every_min = 15
 quiet_min = 20     # never restart when a post / delete / stats read is due within this many minutes
+
+[remote]                           # remote dashboard: https://dashboard.zulfkhar.dev via Cloudflare Tunnel (see access.py)
+port = 8081                        # cloudflared sends traffic here; every request needs the PIN cookie
+pin = ""                           # empty = remote dashboard off; use 8+ characters
+days = 30                          # stay logged in this long
+max_tries = 10                     # wrong PINs per 15 minutes before the login locks for 15 minutes

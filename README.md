@@ -16,7 +16,7 @@ The box always starts the connection (over Tailscale), so the server never needs
 ```bash
 cp config.example.toml config.toml   # then fill in the phone serial, accounts, email (app password)
 uv sync
-uv run python engine.py              # dashboard: http://127.0.0.1:8080
+uv run python engine.py              # dashboard: http://127.0.0.1:8080 (remote: https://dashboard.zulfkhar.dev)
 ```
 `config.toml`, the databases, `mailbox/`, `logs/` and `runs/` are local only (gitignored).
 
@@ -29,7 +29,14 @@ uv run python engine.py              # dashboard: http://127.0.0.1:8080
 | `instagram_upload.py`, `tiktok_upload.py` | post one video, checking every screen before tapping |
 | `stats.py`, `research.py`, `delete.py`, `accounts.py` | stats reads, research sessions, test clean-up, account switching |
 | `updater.py` | self-update from the `deploy` branch |
+| `access.py` | PIN gate for the remote dashboard |
 | `flows/` | how each app flow works, with lessons from failures |
+
+## Remote dashboard
+`https://dashboard.zulfkhar.dev` -> Cloudflare Tunnel (`cloudflared` on this box, outbound only, no open ports) ->
+`127.0.0.1:8081`, where every request needs the PIN (`[remote].pin` in config.toml; login lasts 30 days, wrong tries
+lock the login for 15 minutes). Changing the PIN and restarting logs everyone out. Port 8080 stays local-only with no
+PIN. Tunnel: `~/.cloudflared/config.yml`, started by `~/Library/LaunchAgents/com.noswipe.cloudflared.plist`.
 
 ## CI/CD
 - **CI** (GitHub Actions, `.github/workflows/ci.yml`): every push and pull request compiles every module and runs

@@ -31,6 +31,7 @@ from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 
+import access
 import updater
 
 from aiohttp import WSMsgType, web
@@ -739,7 +740,8 @@ def main() -> None:
         else:
             con.execute("update jobs set status='waiting', error='engine restarted mid-job' where id=?", (j["id"],))
     con.commit()
-    app = web.Application()
+    gate = access.Gate(CFG["remote"]) if CFG.get("remote", {}).get("pin") else None
+    app = web.Application(middlewares=[access.middleware(gate)])
     app.add_routes([
         web.get("/", page),
         web.get("/api/state", api_state),
@@ -756,8 +758,22 @@ def main() -> None:
     ])
     app.on_startup.append(on_start)
     app.on_cleanup.append(on_stop)
-    web.run_app(app, host=CFG["dashboard"]["host"], port=CFG["dashboard"]["port"], print=lambda *_: print(
-        f"dashboard: http://{CFG['dashboard']['host']}:{CFG['dashboard']['port']}", flush=True))
+    asyncio.run(serve(app, gate))
+
+
+async def serve(app, gate) -> None:
+    runner = web.AppRunner(app)
+    await runner.setup()
+    host = CFG["dashboard"]["host"]
+    await web.TCPSite(runner, host, CFG["dashboard"]["port"]).start()
+    print(f"dashboard: http://{host}:{CFG['dashboard']['port']}", flush=True)
+    if gate:  # cloudflared sends https://dashboard.zulfkhar.dev here; every request needs the PIN cookie
+        await web.TCPSite(runner, "127.0.0.1", gate.port).start()
+        print(f"remote dashboard (PIN): 127.0.0.1:{gate.port}", flush=True)
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
 
 
 if __name__ == "__main__":

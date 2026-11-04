@@ -24,7 +24,7 @@ jobs:
       - name: compile every module
         run: uv run python -m compileall -q -x '/\.venv/' .
       - name: tests
-        run: uv run --with pytest pytest -q
+        run: uv run --with pytest --with pytest-asyncio pytest -q
 
   deploy:
     needs: test
