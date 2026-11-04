@@ -502,8 +502,16 @@ class Runner:
                     post_key=job["post_key"], label=label)
         con.commit()
 
+    async def park(self) -> None:
+        """Between jobs: leave the app (a reel left open keeps looping and keeps the screen on) and lock the screen.
+        Every job wakes the phone itself (Phone.wake), so nothing else needs to change."""
+        await self.adb("-s", SERIAL, "shell", "input", "keyevent", "KEYCODE_HOME")
+        await self.adb("-s", SERIAL, "shell", "input", "keyevent", "KEYCODE_SLEEP")
+
     async def take_over(self) -> None:
         set_state("paused", True)
+        await self.adb("-s", SERIAL, "shell", "input", "keyevent", "KEYCODE_WAKEUP")  # you see a live screen
+        await self.adb("-s", SERIAL, "shell", "wm", "dismiss-keyguard")
         if self.proc and self.job and self.job["kind"] in ("research", "stats"):
             self.interrupted = True
             try:
@@ -532,6 +540,8 @@ class Runner:
                     job, minutes = self.pick(time.time())
                     if job is not None and await self.check_phone():
                         await self.run(job, minutes)
+                        if not self.paused:
+                            await self.park()
                         continue
                 elif self.job is None and int(time.time()) % 60 < 5:
                     await self.check_phone()
@@ -587,6 +597,8 @@ async def api_takeover(_req):
 
 async def api_resume(_req):
     set_state("paused", False)
+    if RUNNER.job is None:
+        await RUNNER.park()
     return web.json_response({"ok": True})
 
 
