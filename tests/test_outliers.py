@@ -24,3 +24,14 @@ def test_merge_same_screen_adds_nothing():
 
 def test_counts():
     assert outliers.count("331K") == 331000 and outliers.count("1,886") == 1886 and outliers.count("2.5M") == 2500000
+
+
+def test_loop_length_finds_one_play():
+    import random
+
+    import reel_record as rr
+    rnd = random.Random(1)
+    play = [bytes(rnd.randrange(256) for _ in range(64)) for _ in range(int(7.5 * rr.FPS))]  # a 7.5 s reel
+    frames = (play * 4)[: 25 * rr.FPS]  # 25 s of it looping
+    assert rr.loop_length(frames) == 7.5
+    assert rr.loop_length([bytes(64)] * 100) is None  # a still picture: no loop to see

@@ -75,6 +75,7 @@ max_tries = 10                     # wrong PINs per 15 minutes before the login 
 
 [outliers]   # weekly niche-outlier scan (outliers.py) on a practice account; results go to the render server
 account = "nomoreawkwardness"   # Instagram account that does the browsing (never the live one)
+enabled = false                 # set true to run the weekly scan
 every_days = 7
 after = "10:00"                 # not before this time of day
 minutes = 40
