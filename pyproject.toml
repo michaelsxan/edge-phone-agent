@@ -1,7 +1,7 @@
 [project]
-name = "flagd-phone-worker"
+name = "content-engine"
 version = "0.1.0"
-description = "Drives TikTok and Instagram on the flagd Android phone with uiautomator2"
+description = "noswipe content engine: posts, stats and research on the Android phone, driven by nightly plans"
 requires-python = ">=3.12"
 dependencies = [
   "uiautomator2>=3.2,<4",
@@ -11,3 +11,6 @@ dependencies = [
 
 [tool.uv]
 package = false
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

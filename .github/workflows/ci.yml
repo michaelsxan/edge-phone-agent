@@ -1,0 +1,38 @@
+# CI: test every push and pull request. CD: when main is green, move the `deploy` branch to it.
+# The box (Mac now, Raspberry Pi later) pulls `deploy` by itself while idle (updater.py): nothing here can reach it.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: ffmpeg (the plan validator probes videos)
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --frozen
+      - name: compile every module
+        run: uv run python -m compileall -q -x '/\.venv/' .
+      - name: tests
+        run: uv run --with pytest pytest -q
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: move deploy to this commit (the box picks it up within ~15 min, when no post is near)
+        run: git push origin "HEAD:refs/heads/deploy"

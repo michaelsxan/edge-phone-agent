@@ -1,6 +1,6 @@
 # Content engine (job runner + dashboard)
 
-Start: `cd ~/flagd-ugc/phone-worker && uv run python engine.py` → http://127.0.0.1:8080
+Start: `cd ~/content-engine && uv run python engine.py` → http://127.0.0.1:8080
 Settings: `config.toml` (phone serial, accounts + daily limits, stats offsets, email alerts).
 
 ## Plans

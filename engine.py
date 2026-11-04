@@ -2,6 +2,8 @@
 
   uv run python engine.py            -> dashboard on http://127.0.0.1:8080
 
+New code arrives by itself: see updater.py (CI moves the deploy branch; the engine fast-forwards while idle).
+
 Plans arrive as mailbox/inbox/<name>/plan.json (+ videos/). Each plan is imported once into engine.db as jobs:
   post      one per post x app/account, at a random minute of its round hour (12/16/20) or at an exact "at"
   stats     added after a post succeeds, at the configured offsets (1h 3h 6h 12h 24h 48h)
@@ -28,6 +30,8 @@ import tomllib
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
+
+import updater
 
 from aiohttp import WSMsgType, web
 
@@ -517,6 +521,12 @@ class Runner:
                 schedule_preflight()
                 check_plan_arrived()
                 cleanup()
+                if not self.paused and self.job is None:
+                    nxt = db().execute("select min(run_at) from jobs where status='waiting' "
+                                       "and kind in ('preflight','post','delete','stats')").fetchone()[0]
+                    if await asyncio.to_thread(updater.check, CFG, True, nxt, alert):
+                        print("restarting on the new code", flush=True)
+                        os.execv(sys.executable, [sys.executable, *sys.argv])
                 if not self.paused and self.job is None:
                     job, minutes = self.pick(time.time())
                     if job is not None and await self.check_phone():

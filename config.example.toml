@@ -61,3 +61,8 @@ app_password = ""            # your Gmail app password (never commit it)
 
 [instagram]
 meta_ai_audio = "off"   # "off" = Turn off and share, "allow" = Share; unset = refuse and alert
+
+[update]   # self-update: CI moves the deploy branch after green tests; the engine fast-forwards while idle
+branch = "deploy"
+every_min = 15
+quiet_min = 20     # never restart when a post / delete / stats read is due within this many minutes

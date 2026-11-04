@@ -13,3 +13,4 @@ maps/
 maps-run.log
 viewer/
 .engine.lock
+.pytest_cache/
