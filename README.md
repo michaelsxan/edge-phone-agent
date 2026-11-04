@@ -30,6 +30,7 @@ uv run python engine.py              # dashboard: http://127.0.0.1:8080 (remote:
 | `stats.py`, `research.py`, `delete.py`, `accounts.py` | stats reads, research sessions, test clean-up, account switching |
 | `updater.py` | self-update from the `deploy` branch |
 | `access.py` | PIN gate for the remote dashboard |
+| `outliers.py` | weekly niche-outlier scan (practice account): reels at 5x+ their account's median, with opening frames, for the nightly run |
 | `flows/` | how each app flow works, with lessons from failures |
 
 ## Remote dashboard

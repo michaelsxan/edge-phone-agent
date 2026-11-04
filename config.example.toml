@@ -72,3 +72,15 @@ port = 8081                        # cloudflared sends traffic here; every reque
 pin = ""                           # empty = remote dashboard off; use 8+ characters
 days = 30                          # stay logged in this long
 max_tries = 10                     # wrong PINs per 15 minutes before the login locks for 15 minutes
+
+[outliers]   # weekly niche-outlier scan (outliers.py) on a practice account; results go to the render server
+account = "nomoreawkwardness"   # Instagram account that does the browsing (never the live one)
+every_days = 7
+after = "10:00"                 # not before this time of day
+minutes = 40
+queries = ["animated love story", "love story animation", "couple animation", "cute couple cartoon",
+           "silent animation story", "relationship animation", "crush story animation", "shy guy dating",
+           "awkward first date", "approach anxiety"]
+accounts = []                   # niche accounts we follow (approved by hand); discovery adds more by itself
+ratio = 5                       # outlier = at least this many times the account median views
+min_views = 20000

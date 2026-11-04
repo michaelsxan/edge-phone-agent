@@ -274,6 +274,24 @@ def schedule_preflight() -> None:
     con.commit()
 
 
+def schedule_outliers() -> None:
+    """Every [outliers].every_days days queue one niche-outlier scan (outliers.py) on the practice account. It is a
+    research job (args mode=outliers): it only runs in a gap between fixed jobs and counts as research time."""
+    o = CFG.get("outliers", {})
+    if not o.get("account") or o.get("enabled", True) is False:
+        return
+    last = float(get_state("outliers_queued") or 0)
+    if time.time() - last < o.get("every_days", 7) * 86400:
+        return
+    if datetime.now().strftime("%H:%M") < o.get("after", "10:00"):
+        return
+    set_state("outliers_queued", time.time())
+    con = db()
+    add_job(con, plan="weekly", kind="research", app="instagram", account=o["account"], run_at=time.time(),
+            args={"mode": "outliers", "minutes": o.get("minutes", 40)}, label="niche outliers")
+    con.commit()
+
+
 # ================================================================ disk clean-up
 _last_cleanup = 0.0
 
@@ -384,7 +402,7 @@ class Runner:
                           (r["not_after"] - now) / 60 if r["not_after"] else 1e9,
                           (nxt - now) / 60 - SCHED["research_margin_min"] if nxt else 1e9,
                           lim.get("research_minutes_per_day", 60) - used["research_minutes"])
-            if minutes >= 2:
+            if minutes >= (20 if a.get("mode") == "outliers" else 2):
                 return r, round(minutes, 1)
         return None, None
 
@@ -407,6 +425,8 @@ class Runner:
             if app == "tiktok" and a.get("offset_min", 0) >= SCHED["tiktok_detailed_from_min"]:
                 cmd.append("--detailed")
             return cmd
+        if job["kind"] == "research" and a.get("mode") == "outliers":
+            return [py, "outliers.py", "--account", acct, "--minutes", str(minutes)]
         if job["kind"] == "research":
             lim, used = acct_cfg(app, acct), used_today(app, acct)
             likes = max(0, min(int(a.get("max_likes", 3)), lim.get("likes_per_day", 20) - used["likes"]))
@@ -528,6 +548,7 @@ class Runner:
                     alert("sync", f"sync failed: {ex!r}")
                 import_plans()
                 schedule_preflight()
+                schedule_outliers()
                 check_plan_arrived()
                 cleanup()
                 if not self.paused and self.job is None:
