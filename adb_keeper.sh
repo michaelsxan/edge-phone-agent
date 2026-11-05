@@ -4,7 +4,7 @@
 # phone turns Wireless debugging back on; as soon as its mDNS service shows up, reconnect and switch
 # adbd back to tcpip 5555. Every adb call is time-limited so a phone that drops mid-command can't hang this loop.
 TCP="192.168.1.150:5555"
-t() { perl -e 'alarm shift; exec @ARGV' 20 "$@"; }
+if command -v timeout >/dev/null; then t() { timeout 20 "$@"; }; else t() { perl -e 'alarm shift; exec @ARGV' 20 "$@"; }; fi  # Linux | macOS
 while true; do
   if ! t adb -s "$TCP" get-state 2>/dev/null | grep -q device; then
     t adb disconnect "$TCP" >/dev/null 2>&1
