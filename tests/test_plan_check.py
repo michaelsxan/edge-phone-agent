@@ -27,7 +27,7 @@ def folder(tmp_path_factory) -> Path:
     d = tmp_path_factory.mktemp("plan")
     (d / "videos").mkdir()
     for name, size in (("v.mp4", "360x640"), ("wide.mp4", "640x360")):
-        subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", f"testsrc=size={size}:rate=30", "-t", "4",
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", f"testsrc=size={size}:rate=30", "-vf", "noise=alls=30:allf=t", "-t", "4",
                         "-b:v", "2M", "-pix_fmt", "yuv420p", str(d / "videos" / name)], check=True)
     return d
 
