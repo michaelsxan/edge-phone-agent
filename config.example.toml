@@ -85,3 +85,7 @@ queries = ["animated love story", "love story animation", "couple animation", "c
 accounts = []                   # niche accounts we follow (approved by hand); discovery adds more by itself
 ratio = 5                       # outlier = at least this many times the account median views
 min_views = 20000
+
+[health]   # dead-man's switch: healthchecks.io emails you when the engine stops pinging (Pi off, offline, crashed)
+engine_url = ""                 # ping URL of a check with period 10 min and grace 90 min (one job can run ~60 min)
+every_min = 5

@@ -26,6 +26,7 @@ import smtplib
 import sqlite3
 import sys
 import time
+import urllib.request
 import tomllib
 from datetime import datetime, timedelta
 from email.message import EmailMessage
@@ -256,6 +257,25 @@ def check_plan_arrived() -> None:
 
 
 # ================================================================ morning preflight
+_last_beat = 0.0
+
+
+def heartbeat() -> None:
+    """Ping [health].engine_url (a healthchecks.io check) every [health].every_min minutes while the runner loop is
+    alive. A silent engine (Pi off, no network, crashed loop) then reaches the user as an email from healthchecks.io,
+    which this box could not send itself. Off when no URL is set."""
+    global _last_beat
+    h = CFG.get("health", {})
+    url = h.get("engine_url")
+    if not url or time.time() - _last_beat < h.get("every_min", 5) * 60:
+        return
+    _last_beat = time.time()
+    try:
+        urllib.request.urlopen(url, timeout=10).read()
+    except Exception as ex:
+        print(f"heartbeat failed: {ex!r}", flush=True)
+
+
 def schedule_preflight() -> None:
     """Once a day at [preflight].at (default 09:30, local time) queue a preflight job (phone, accounts, disks,
     render server, today's plan). It runs like any job: failure -> one retry -> email with every problem found."""
@@ -551,6 +571,7 @@ class Runner:
                 schedule_outliers()
                 check_plan_arrived()
                 cleanup()
+                await asyncio.to_thread(heartbeat)
                 if not self.paused and self.job is None:
                     nxt = db().execute("select min(run_at) from jobs where status='waiting' "
                                        "and kind in ('preflight','post','delete','stats')").fetchone()[0]
