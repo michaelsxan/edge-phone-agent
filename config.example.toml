@@ -6,6 +6,7 @@ serial = "192.168.1.150:5555"     # later on the Pi: the USB serial (see `adb de
 [dashboard]
 host = "127.0.0.1"                 # local only; remote access goes through [access] below
 port = 8080
+resume_after_min = 10            # a dashboard take-over nobody touches this long resumes by itself (0 = never)
 
 [mailbox]
 inbox = "mailbox/inbox"            # one folder per day: plan.json + videos/ (later synced from S3)

@@ -550,6 +550,7 @@ class Runner:
 
     async def take_over(self) -> None:
         set_state("paused", True)
+        touch()
         await self.adb("-s", SERIAL, "shell", "input", "keyevent", "KEYCODE_WAKEUP")  # you see a live screen
         await self.adb("-s", SERIAL, "shell", "wm", "dismiss-keyguard")
         if self.proc and self.job and self.job["kind"] in ("research", "stats"):
@@ -559,9 +560,19 @@ class Runner:
             except ProcessLookupError:
                 pass
 
+    async def auto_resume(self) -> None:
+        """A take-over nobody touches for [dashboard].resume_after_min minutes ends by itself, so a forgotten
+        dashboard tab never stops the day's posts."""
+        idle = CFG.get("dashboard", {}).get("resume_after_min", 10)
+        if self.paused and self.job is None and idle and time.time() - (get_state("touched", 0) or 0) > idle * 60:
+            set_state("paused", False)
+            alert("pause", f"take-over idle for {idle} min: resumed by itself", every_min=0)
+            await self.park()
+
     async def loop(self) -> None:
         while True:
             try:
+                await self.auto_resume()
                 try:
                     await asyncio.to_thread(sync)
                 except Exception as ex:
@@ -714,10 +725,16 @@ async def screen_png(_req):
     return web.Response(body=out, content_type="image/png", headers={"Cache-Control": "no-store"})
 
 
+def touch() -> None:
+    """You used the phone from the dashboard: keeps a take-over from resuming by itself."""
+    set_state("touched", time.time())
+
+
 async def screen_input(req):
     """Fallback input (adb), only while taken over."""
     if not RUNNER.paused:
         return web.json_response({"ok": False, "error": "take over first"}, status=409)
+    touch()
     m = await req.json()
     if m["t"] == "tap":
         await RUNNER.adb("-s", SERIAL, "shell", "input", "tap", str(int(m["x"])), str(int(m["y"])))
@@ -744,6 +761,7 @@ async def ws_screen(req):
             if msg.type == WSMsgType.TEXT:
                 m = json.loads(msg.data)
                 if RUNNER.paused:  # the phone is yours only while taken over
+                    touch()
                     await MIRROR.handle(m)
     finally:
         await MIRROR.remove(ws)
