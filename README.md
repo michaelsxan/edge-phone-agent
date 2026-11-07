@@ -1,53 +1,149 @@
 # edge-phone-agent
 
-The box that runs noswipe's short-video accounts on a real Android phone: it posts the nightly plan to
-Instagram/TikTok, reads each post's stats (1h 3h 6h 12h 24h 48h), does research sessions (search, watch,
-like, comment), and serves a dashboard with a live phone screen. It runs on a Raspberry Pi 5 (checkout in
-`~/content-engine`, branch `deploy`; the folder and the systemd unit keep the old name).
+Runs noswipe's short-video accounts on a real Android phone, from a Raspberry Pi next to it. It posts the videos
+that the nightly run in [noswipe-playbook](https://github.com/zulfkhar00/noswipe-playbook) makes, reads each post's
+stats, runs research sessions (search, watch, like, comment), and serves a dashboard with a live phone screen.
+Python 3.12, asyncio, `adb` + scrcpy. Everything is driven through the phone's UI: no platform APIs.
+
+## The system
 
 ```
-render server (noswipe-playbook)                    this box (edge-phone-agent)               phone
-  nightly Claude run -> ~/outbox/<day>/  --pull-->  mailbox/inbox -> engine.db jobs  --adb-->  Instagram / TikTok
-  ~/feedback/ (stats, research, jobs)   <--push--  stats.db research.db engine.db
+ render server (IONOS VM, Tailscale 100.102.103.115)        Raspberry Pi 5 (this repo)                phone (moto g 5G)
+ repo noswipe-playbook, cron 00:30 PT                         ~/content-engine, systemd                Instagram / TikTok
+   nightly Claude Code run                                     engine.py
+     reads ~/feedback/*.db  <------- rsync push every 10 min -- stats.db research.db engine.db
+     writes ~/outbox/<day>/ ------- rsync pull every 10 min --> mailbox/inbox/<day>/ -> jobs   -- adb over Wi-Fi -->
+                                                               dashboard :8080 (local), :8081 (PIN)
+                                                               <- Cloudflare Tunnel <- https://dashboard.zulfkhar.dev
+ healthchecks.io  <- nightly start/exit pings                  <- engine heartbeat every 5 min
 ```
-The box always starts the connection (over Tailscale), so the server never needs access to it.
 
-## Run
-```bash
-cp config.example.toml config.toml   # then fill in the phone serial, accounts, email (app password)
-uv sync
-uv run python engine.py              # dashboard: http://127.0.0.1:8080 (remote: https://dashboard.zulfkhar.dev)
-```
-`config.toml`, the databases, `mailbox/`, `logs/` and `runs/` are local only (gitignored).
+- The Pi always opens the connection (SSH over Tailscale). The server never needs access to the Pi.
+- A day's loop: 00:30 PT the server plans and renders that day's videos into `~/outbox/<day>/` (about 1.5 h) ->
+  the Pi pulls it and imports it as jobs -> 09:30 preflight -> posts from 12:30 at planned times -> stats reads at
+  1h 3h 6h 12h 24h 48h after each post -> pushed back to the server, where the next night learns from them.
+- The plan is the only contract between the two repos (see "Plan format"). Stats reach the server as the raw
+  SQLite files.
 
-## Pieces
-| File | Does |
+## Layout
+
+| Path | What it does |
 |---|---|
-| `engine.py` | job runner (post, stats, research, delete, preflight), plan import, sync, alerts, dashboard |
-| `plan_check.py` | validates a nightly plan before it becomes jobs (nothing in it is trusted) |
-| `preflight.py` | 09:30 checks: phone, accounts logged in, disks, render server, today's plan |
-| `instagram_upload.py`, `tiktok_upload.py` | post one video, checking every screen before tapping |
-| `stats.py`, `research.py`, `delete.py`, `accounts.py` | stats reads, research sessions, test clean-up, account switching |
-| `updater.py` | self-update from the `deploy` branch |
+| `engine.py` | The whole service: job runner, plan import, sync with the server, alerts (dashboard + email), heartbeat, self-update trigger, auto-resume, web dashboard and API |
+| `plan_check.py` | Validates a plan before it becomes jobs (nothing in it is trusted: paths, captions, accounts, limits, video files) |
+| `preflight.py` | Daily morning checks: phone, battery, accounts logged in, disks, render server, today's plan |
+| `phone.py` | Shared phone helpers: read the screen as labelled nodes, wait for an expected screen, tap by label/id, type. Anything unexpected aborts with a screenshot |
+| `instagram_upload.py`, `tiktok_upload.py` | Post one video, checking every screen before tapping |
+| `stats.py` | Read one post's insights (OCR with macOS Vision, tesseract on Linux) |
+| `research.py` | Research sessions: search a keyword, watch, like and comment within limits; results in `research.db` |
+| `explore.py` | Dev tool: maps an app's screens and how they connect (for writing new flows) |
+| `accounts.py`, `delete.py` | Switch accounts in each app; delete test posts |
+| `outliers.py`, `reel_record.py` | Niche-outlier scan and reel recording/breakdown (scan is off; used by hand for reference accounts) |
+| `updater.py` | Self-update from `origin/deploy` (see "CI/CD") |
 | `access.py` | PIN gate for the remote dashboard |
-| `outliers.py` | weekly niche-outlier scan (practice account): reels at 5x+ their account's median, with opening frames, for the nightly run |
-| `flows/` | how each app flow works, with lessons from failures |
+| `scrcpy_bridge.py`, `vendor/scrcpy-server-*.jar` | Live screen and touch input for the dashboard |
+| `adb_keeper.sh` | Keeps the phone reachable: reconnects, finds it by hardware serial on any network, updates `[phone].serial`, restarts the engine |
+| `web/dashboard.html` | The dashboard (single page) |
+| `flows/*.md` | How each app flow works and what broke before. Read the relevant one before changing an uploader or reader |
+| `tests/` | pytest: plan validation, self-update, access gate, outliers |
+| `*_chain.sh`, `build_viewer.py`, `publish_viewer.sh` | Old one-off tools from the Mac era; not used by the service |
 
-## Remote dashboard
-`https://dashboard.zulfkhar.dev` -> Cloudflare Tunnel (`cloudflared` on this box, outbound only, no open ports) ->
-`127.0.0.1:8081`, where every request needs the PIN (`[remote].pin` in config.toml; login lasts 30 days, wrong tries
-lock the login for 15 minutes). Changing the PIN and restarting logs everyone out. Port 8080 stays local-only with no
-PIN. Tunnel: `~/.cloudflared/config.yml`, started by `~/Library/LaunchAgents/com.noswipe.cloudflared.plist`.
+Local only (gitignored): `config.toml` (secrets), `engine.db` (jobs, alerts, state), `stats.db`, `research.db`,
+`mailbox/`, `logs/`, `runs/` (screenshots, recordings).
+
+## Data
+
+- `engine.db` `jobs`: `kind` = post | stats | research | delete | preflight | outliers, `status` = waiting | running |
+  done | failed | unverified | skipped, `run_at` / `not_after` (unix time), `args` JSON, `result` JSON,
+  `post_key` (`<plan>/<post id>/<app>`). Also `alerts`, `plans` (imported names) and `state` (k/v JSON: `paused`,
+  `touched`, ...).
+- `stats.db` `snapshots`: app, account, caption, label (1h ... 48h, manual), taken_at, data JSON (views, viewers,
+  average_watch_time_s, skip_rate_pct, follows, like/share/save/comment rates, sources_pct).
+- `research.db`: `videos`, `comments` seen in research sessions.
+- Posts are matched to stats by the **first 30 characters of the caption**, so those must be unique forever.
+
+## Plan format (from the server)
+
+`mailbox/inbox/<day>/plan.json` + `videos/`. The server writes `~/outbox/.<day>.part/` and renames it when complete.
+```json
+{"day": "2026-11-06",
+ "posts": [{"id": "across-2-a", "at": "12:30", "video": "videos/across-2-a.mp4",
+            "caption": "Title under 60 chars. Description. #tag #tag",
+            "targets": [{"app": "instagram", "account": "tinyloveshows", "audience": "everyone"}]}],
+ "research": [{"app": "instagram", "account": "tinyloveshows", "keyword": "swipe fatigue", "minutes": 12,
+               "max_likes": 5, "max_comments": 1, "not_before": "10:00", "not_after": "16:00"}],
+ "deletes": [], "stats_offsets_min": [60, 180, 360, 720, 1440, 2880]}
+```
+`at` = exact time, or `round` 12/16/20 = a random minute of that hour. Captions are one line of plain ASCII
+(typed with `adb input text`). Accounts and daily limits come from `config.toml`; only `use = "noswipe"` accounts
+may appear in plans. Details and validation rules: `flows/engine.md`, `plan_check.py`.
+
+## How the runner behaves
+
+- Loop every 5 s: sync (every 10 min) -> import plans -> schedule preflight -> plan-arrival check -> clean-up ->
+  heartbeat -> self-update check -> run the next due job.
+- Fixed jobs (post > delete > stats) run at their time; research only fills gaps before the next fixed job.
+- A failed job retries once after 5 min, then alerts. A post that fails after tapping Share becomes `unverified` and
+  is never re-posted automatically.
+- Dashboard "Take over" pauses the runner and hands you the phone. If nobody touches it for
+  `[dashboard].resume_after_min` (10) minutes, it resumes by itself.
+- Alerts go to the dashboard and by email (Gmail app password). healthchecks.io emails when the heartbeat stops
+  (Pi off, offline, loop dead) or when a nightly run fails or never finishes.
+
+## Setup (Raspberry Pi OS Lite 64-bit, Debian 13)
+
+```bash
+sudo apt install -y git adb ffmpeg tesseract-ocr rsync sqlite3
+# scrcpy 3+ is not in Debian: build from source (meson, libsdl3-dev, prebuilt server) into /usr/local/bin
+curl -LsSf https://astral.sh/uv/install.sh | sh
+curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up   # same tailnet as the render server
+# cloudflared from Cloudflare's apt repo or .deb; tunnel "content-engine" -> ~/.cloudflared/config.yml
+git clone -b deploy git@github.com:zulfkhar00/edge-phone-agent.git ~/content-engine   # read-only deploy key
+cd ~/content-engine && uv sync
+cp config.example.toml config.toml   # fill in: phone serial, accounts, email app password, remote PIN, health URL
+```
+- SSH key of `pi` must be in `studio@render-server:~/.ssh/authorized_keys` (sync uses BatchMode SSH).
+- Phone: Developer options -> USB debugging; authorise this machine's `~/.android/adbkey`; switch adbd to TCP
+  once over USB (`adb tcpip 5555`). MacroDroid on the phone turns Wireless debugging back on after reboots.
+  Apps logged in to the accounts in `config.toml`.
+- systemd units (`/etc/systemd/system/`), all `User=pi`, `Restart=always`, `WorkingDirectory=/home/pi/content-engine`:
+  - `content-engine.service`: `uv run python engine.py`, output to `logs/engine.log`
+  - `adb-keeper.service`: `/bin/sh ./adb_keeper.sh`, output to `logs/adb_keeper.log`
+  - `dashboard-tunnel.service`: `cloudflared --no-autoupdate tunnel run content-engine`
+- `pi` has passwordless sudo (the keeper restarts the engine with `sudo -n systemctl`).
+- Wi-Fi: NetworkManager. Keep the Pi and the phone on the **same single network** (others saved with autoconnect off),
+  or connect the phone by USB (then `[phone].serial` is the USB serial and the keeper is not needed).
+
+Run locally on a Mac for development: same `uv sync` + `uv run python engine.py` (OCR uses macOS Vision there).
+
+## Operate
+
+```bash
+ssh pi@100.84.144.56                         # Tailscale (LAN address changes with the network)
+systemctl status content-engine adb-keeper dashboard-tunnel
+tail -f ~/content-engine/logs/engine.log
+sqlite3 ~/content-engine/engine.db "select id,kind,label,status,datetime(run_at,'unixepoch','localtime') from jobs order by run_at desc limit 20"
+curl -X POST 127.0.0.1:8080/api/resume       # un-pause; /api/takeover pauses; /api/job/<id>/now|retry|skip
+adb devices                                  # phone must show "device"
+```
+Dashboard: `http://127.0.0.1:8080` on the Pi (no PIN, local only) or `https://dashboard.zulfkhar.dev` (PIN,
+`[remote].pin`; changing it logs everyone out). API routes are listed at the bottom of `engine.py`.
 
 ## CI/CD
-- **CI** (GitHub Actions, `.github/workflows/ci.yml`): every push and pull request compiles every module and runs
-  `pytest` (plan validation, self-update).
-- **CD**: when `main` is green, CI moves the `deploy` branch to it. The engine checks `origin/deploy` every 15
-  minutes and fast-forwards only while idle with no post due within 20 minutes; it re-runs `uv sync` when the
-  lock changed, refuses code that does not compile (and rolls back), never touches a checkout with local edits,
-  emails what it did, and restarts itself.
-- So: change code -> pull request (or push to `main`) -> green CI -> live on the box within about 15 minutes.
-  Roll back with `git revert` on `main`.
 
-UI flows can't be tested in CI (they need the phone). After changing one, run it once by hand on a practice
-account (see `flows/`).
+- **CI** (`.github/workflows/ci.yml`, every push and PR): compiles every module, runs `pytest`.
+- **CD**: green `main` -> CI moves `deploy`. The engine checks `origin/deploy` every 15 min and fast-forwards only
+  while idle with no fixed job due within `[update].quiet_min` (20) min; re-runs `uv sync` when the lock changed;
+  rolls back code that does not compile; never touches a checkout with local edits; alerts, then restarts itself.
+  `adb-keeper` does not restart itself: `sudo systemctl restart adb-keeper` after changing `adb_keeper.sh`.
+- Roll back with `git revert` on `main`.
+
+## Contributing
+
+- Work on `main` or a PR into it; never edit files on the Pi (local edits block self-update; `config.toml` is the
+  only file that changes there).
+- Never commit `config.toml` or databases. Secrets live only in `config.toml`.
+- UI flows can't run in CI. After changing an uploader, reader or research flow, run it once by hand against the
+  practice account (`use = "practice"`) and update its `flows/*.md`.
+- Safety rules the code keeps: research on the live account stays within `config.toml` daily limits; the outliers
+  scan only browses with the practice account (never like, follow, save or send); never tap paid upsells.
