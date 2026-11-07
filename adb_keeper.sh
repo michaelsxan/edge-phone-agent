@@ -42,7 +42,7 @@ scan() {  # every host on our IPv4 subnets with port 5555 open that is our phone
 }
 
 log "keeper started; phone $(cfg serial), hardware serial $HW"
-misses=0; down=0
+misses=0; down=0  # down: when the phone stopped answering (0 = it answers); blips fixed by one reconnect are not logged
 back() {  # $1: how it came back
   [ "$down" -gt 0 ] && log "phone back at $TCP after $(( $(date +%s) - down ))s ($1)"
   down=0; misses=0
@@ -50,14 +50,14 @@ back() {  # $1: how it came back
 while true; do
   TCP="$(cfg serial)"
   if ! t adb -s "$TCP" get-state 2>/dev/null | grep -q device; then
-    if [ "$down" -eq 0 ]; then
-      down=$(date +%s)
-      log "phone $TCP not answering: port 5555 $(port "$TCP"), ping $(ping -c1 -W2 "${TCP%%:*}" >/dev/null 2>&1 && echo ok || echo fails)"
-    fi
     t adb disconnect "$TCP" >/dev/null 2>&1
     if t adb connect "$TCP" 2>/dev/null | grep -q "connected to" && is_phone "$TCP"; then
       back "reconnected to the same address"
     else
+      if [ "$down" -eq 0 ]; then
+        down=$(date +%s)
+        log "phone $TCP not answering: port 5555 $(port "$TCP"), ping $(ping -c1 -W2 "${TCP%%:*}" >/dev/null 2>&1 && echo ok || echo fails)"
+      fi
       P=$(t adb mdns services | awk -v hw="adb-$HW" '$0 ~ hw && /tls-connect/ {print $NF; exit}')
       if [ -n "$P" ]; then
         t adb connect "$P" >/dev/null 2>&1; sleep 2
