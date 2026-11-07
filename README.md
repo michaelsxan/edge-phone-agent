@@ -1,12 +1,12 @@
-# content-engine
+# edge-phone-agent
 
 The box that runs noswipe's short-video accounts on a real Android phone: it posts the nightly plan to
 Instagram/TikTok, reads each post's stats (1h 3h 6h 12h 24h 48h), does research sessions (search, watch,
-like, comment), and serves a dashboard with a live phone screen. It runs on a Mac now and moves to a
-Raspberry Pi later.
+like, comment), and serves a dashboard with a live phone screen. It runs on a Raspberry Pi 5 (checkout in
+`~/content-engine`, branch `deploy`; the folder and the systemd unit keep the old name).
 
 ```
-render server (noswipe-videos)                      this box (content-engine)                 phone
+render server (noswipe-playbook)                    this box (edge-phone-agent)               phone
   nightly Claude run -> ~/outbox/<day>/  --pull-->  mailbox/inbox -> engine.db jobs  --adb-->  Instagram / TikTok
   ~/feedback/ (stats, research, jobs)   <--push--  stats.db research.db engine.db
 ```
