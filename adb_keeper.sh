@@ -9,7 +9,11 @@
 #      turns Wireless debugging back on; when its mDNS service shows up, connect to it and switch adbd back to
 #      tcpip 5555.
 # Every adb call is time-limited so a phone that drops mid-command can't hang this loop.
+# Logs (logs/adb_keeper.log): when the phone stops answering and why, progress every ~5 min while it is missing,
+# and when and how it came back.
 cd "$(dirname "$0")"
+log() { echo "$(date '+%F %T') $*"; }
+port() { timeout 2 bash -c "echo > /dev/tcp/${1%%:*}/${1##*:}" 2>/dev/null && echo open || echo closed; }
 if command -v timeout >/dev/null; then t() { timeout 20 "$@"; }; else t() { perl -e 'alarm shift; exec @ARGV' 20 "$@"; }; fi  # Linux | macOS
 
 cfg() { sed -n "s/^$1 *= *\"\([^\"]*\)\".*/\1/p" config.toml | head -1; }
@@ -19,7 +23,7 @@ is_phone() { [ "$(t adb -s "$1" shell getprop ro.serialno 2>/dev/null | tr -d '\
 use() {  # the phone answers at $1 (ip:5555): make it the configured address
   [ "$1" = "$TCP" ] && return
   sed -i.bak "s/^serial *= *\"[^\"]*\"/serial = \"$1\"/" config.toml && rm -f config.toml.bak
-  echo "$(date +%H:%M:%S) keeper: phone moved $TCP -> $1; restarting the engine"
+  log "phone moved $TCP -> $1; restarting the engine"
   TCP="$1"
   if command -v systemctl >/dev/null; then sudo -n systemctl restart content-engine 2>/dev/null; fi
 }
@@ -37,13 +41,22 @@ scan() {  # every host on our IPv4 subnets with port 5555 open that is our phone
   done
 }
 
-misses=0
+log "keeper started; phone $(cfg serial), hardware serial $HW"
+misses=0; down=0
+back() {  # $1: how it came back
+  [ "$down" -gt 0 ] && log "phone back at $TCP after $(( $(date +%s) - down ))s ($1)"
+  down=0; misses=0
+}
 while true; do
   TCP="$(cfg serial)"
   if ! t adb -s "$TCP" get-state 2>/dev/null | grep -q device; then
+    if [ "$down" -eq 0 ]; then
+      down=$(date +%s)
+      log "phone $TCP not answering: port 5555 $(port "$TCP"), ping $(ping -c1 -W2 "${TCP%%:*}" >/dev/null 2>&1 && echo ok || echo fails)"
+    fi
     t adb disconnect "$TCP" >/dev/null 2>&1
     if t adb connect "$TCP" 2>/dev/null | grep -q "connected to" && is_phone "$TCP"; then
-      misses=0
+      back "reconnected to the same address"
     else
       P=$(t adb mdns services | awk -v hw="adb-$HW" '$0 ~ hw && /tls-connect/ {print $NF; exit}')
       if [ -n "$P" ]; then
@@ -51,18 +64,19 @@ while true; do
         t adb -s "$P" tcpip 5555 >/dev/null 2>&1; sleep 4
         NEW="${P%%:*}:5555"
         t adb connect "$NEW" >/dev/null 2>&1
-        echo "$(date +%H:%M:%S) keeper: restored $NEW via $P"
-        is_phone "$NEW" && use "$NEW"
+        log "Wireless debugging found at $P: switched adbd back to $NEW"
+        is_phone "$NEW" && { use "$NEW"; TCP="$NEW"; back "via Wireless debugging"; }
       else
         misses=$((misses + 1))
         if [ $((misses % 4)) -eq 1 ]; then  # a subnet scan about once a minute while the phone is missing
           NEW="$(scan)"
-          [ -n "$NEW" ] && { use "$NEW"; misses=0; }
+          [ -n "$NEW" ] && { use "$NEW"; TCP="$NEW"; back "found by subnet scan"; }
         fi
+        [ "$down" -gt 0 ] && [ $((misses % 20)) -eq 0 ] && log "still missing after $(( $(date +%s) - down ))s: port 5555 $(port "$TCP"), Wireless debugging not advertised, not found on the subnet"
       fi
     fi
   else
-    misses=0
+    back "answered again"
   fi
   sleep 15
 done
