@@ -2,6 +2,7 @@
 
 [phone]
 serial = "192.168.1.150:5555"     # later on the Pi: the USB serial (see `adb devices`)
+hw_serial = "ZD222RWWGT"        # the phone's own serial (adb shell getprop ro.serialno): adb_keeper.sh finds it by this on a new network
 
 [dashboard]
 host = "127.0.0.1"                 # local only; remote access goes through [access] below
