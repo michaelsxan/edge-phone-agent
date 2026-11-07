@@ -237,6 +237,8 @@ function codecFromSps(cfg) {
   }
   return "avc1.42e01e";
 }
+// fell behind: ask the phone for a fresh key frame instead of waiting for the next scheduled one
+const askKey = () => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({t: "keyframe"})); };
 function startStream() {
   let dec = null, cfg = null, gotKey = false;
   ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/screen");
@@ -251,13 +253,13 @@ function startStream() {
       if (dec) try { dec.close(); } catch (e) {}
       dec = new VideoDecoder({
         output: f => { ctx.drawImage(f, 0, 0, W, H); f.close(); msg.style.display = "none"; },
-        error: e => { console.warn(e); gotKey = false; },
+        error: e => { console.warn(e); gotKey = false; askKey(); },
       });
       dec.configure({codec: codecFromSps(cfg), optimizeForLatency: true});
     } else if (t === 3 && dec && dec.state === "configured") {
       const key = u[1] === 1;
       if (!gotKey && !key) return;
-      if (dec.decodeQueueSize > 8 && !key) { gotKey = false; return; }
+      if (dec.decodeQueueSize > 3 && !key) { gotKey = false; askKey(); return; }
       let data = u.subarray(2);
       if (key) { const d = new Uint8Array(cfg.length + data.length); d.set(cfg); d.set(data, cfg.length); data = d; gotKey = true; }
       dec.decode(new EncodedVideoChunk({type: key ? "key" : "delta", timestamp: performance.now() * 1000, data}));

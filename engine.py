@@ -760,7 +760,9 @@ async def ws_screen(req):
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
                 m = json.loads(msg.data)
-                if RUNNER.paused:  # the phone is yours only while taken over
+                if m.get("t") == "keyframe":  # the viewer's decoder fell behind: watching needs no take-over
+                    MIRROR.want_key()
+                elif RUNNER.paused:  # the phone is yours only while taken over
                     touch()
                     await MIRROR.handle(m)
     finally:

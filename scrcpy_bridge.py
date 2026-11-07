@@ -13,7 +13,9 @@ To browsers each WebSocket binary message is: 1 + w,h (u32 BE) | 2 + config (SPS
 from __future__ import annotations
 
 import asyncio
+import collections
 import random
+import time
 import struct
 from pathlib import Path
 
@@ -27,37 +29,44 @@ KEYS = {"home": 3, "back": 4, "recents": 187, "power": 26, "wake": 224, "enter":
 
 
 class Viewer:
-    def __init__(self, ws):
+    """One browser. Frames wait in a short queue; when the oldest has waited longer than LAG (slow connection),
+    the queued frames are dropped and a fresh key frame is requested, so the picture stays live instead of
+    drifting seconds behind the phone (and never waits for the encoder's next scheduled key frame)."""
+    LAG = 0.25  # seconds
+
+    def __init__(self, ws, want_key):
         self.ws = ws
-        self.q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=90)
+        self.q: collections.deque[tuple[float, bytes]] = collections.deque()
+        self.ready = asyncio.Event()
+        self.want_key = want_key
         self.need_key = True
         self.task: asyncio.Task | None = None
 
     def offer(self, msg: bytes) -> None:
-        kind = msg[0]
-        if kind == 3:
+        now = time.monotonic()
+        if msg[0] == 3:
             key = msg[1] == 1
-            if self.need_key and not key:
-                return
-            if self.q.full():  # slow connection: drop everything and wait for the next key frame
-                while not self.q.empty():
-                    self.q.get_nowait()
+            if self.q and now - self.q[0][0] > self.LAG:
+                self.q = collections.deque((now, m[1]) for m in self.q if m[1][0] != 3)  # keep size/config
                 self.need_key = True
+                self.want_key()
+            if self.need_key and not key:
                 return
             if key:
                 self.need_key = False
-        elif self.q.full():
-            self.q.get_nowait()
-        self.q.put_nowait(msg)
+        self.q.append((now, msg))
+        self.ready.set()
 
     async def pump(self) -> None:
         while True:
-            msg = await self.q.get()
-            await self.ws.send_bytes(msg)
+            await self.ready.wait()
+            while self.q:
+                await self.ws.send_bytes(self.q.popleft()[1])
+            self.ready.clear()
 
 
 class Mirror:
-    def __init__(self, serial: str, max_size: int = 0, bit_rate: int = 4_000_000, max_fps: int = 30):
+    def __init__(self, serial: str, max_size: int = 1280, bit_rate: int = 2_500_000, max_fps: int = 30):
         self.serial = serial
         self.max_size, self.bit_rate, self.max_fps = max_size, bit_rate, max_fps
         self.viewers: dict[object, Viewer] = {}
@@ -70,6 +79,7 @@ class Mirror:
         self.config: bytes | None = None
         self.lock = asyncio.Lock()
         self.error: str | None = None
+        self.key_asked = 0.0
 
     # ------------------------------------------------------------ lifecycle
     async def _adb(self, *args: str, timeout: float = 30) -> str:
@@ -170,7 +180,7 @@ class Mirror:
         if self.stop_handle:
             self.stop_handle.cancel()
             self.stop_handle = None
-        v = Viewer(ws)
+        v = Viewer(ws, self.want_key)
         self.viewers[ws] = v
         v.task = asyncio.create_task(v.pump())
         await self.start()
@@ -187,6 +197,13 @@ class Mirror:
         if not self.viewers:  # keep it warm briefly in case the page reloads
             loop = asyncio.get_running_loop()
             self.stop_handle = loop.call_later(20, lambda: asyncio.ensure_future(self.stop()))
+
+    def want_key(self) -> None:
+        """A viewer fell behind or its decoder failed: ask the encoder for a key frame now (at most 2 per second)."""
+        now = time.monotonic()
+        if now - self.key_asked > 0.5:
+            self.key_asked = now
+            asyncio.ensure_future(self._send(b"\x11"))  # RESET_VIDEO
 
     # ------------------------------------------------------------ control
     async def _send(self, msg: bytes) -> None:
