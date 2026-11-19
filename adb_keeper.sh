@@ -1,10 +1,14 @@
 #!/bin/bash
-# Keep the phone reachable over Wi-Fi adb, on whatever network it is.
-# The address lives in config.toml ([phone].serial, "ip:5555"). When the phone is not there:
+# Keep the phone reachable over adb. The USB cable is the main link (the engine prefers it: [phone].hw_serial);
+# Wi-Fi adb is the backup, kept alive here.
+# With the cable in: if Wi-Fi adb is off (after a phone reboot tcpip mode resets), switch it back on over the cable
+#   (adb tcpip 5555, only while the engine is idle: it restarts adbd) and record the phone's Wi-Fi address.
+# With the cable out, Wi-Fi recovery as before.
+# The Wi-Fi address lives in config.toml ([phone].serial, "ip:5555"); the engine re-reads it, no restart needed.
+# When the phone is not there over Wi-Fi:
 #   1. reconnect to the same address (a short Wi-Fi drop);
 #   2. find the phone on the local network by its hardware serial ([phone].hw_serial), checking every host
-#      with port 5555 open (a new network or a new DHCP address), then write the new address into config.toml
-#      and restart the engine so it uses it;
+#      with port 5555 open (a new network or a new DHCP address), then write the new address into config.toml;
 #   3. Wi-Fi band changes and reboots switch off both Wireless debugging and tcpip mode. MacroDroid on the phone
 #      turns Wireless debugging back on; when its mDNS service shows up, connect to it and switch adbd back to
 #      tcpip 5555.
@@ -23,9 +27,27 @@ is_phone() { [ "$(t adb -s "$1" shell getprop ro.serialno 2>/dev/null | tr -d '\
 use() {  # the phone answers at $1 (ip:5555): make it the configured address
   [ "$1" = "$TCP" ] && return
   sed -i.bak "s/^serial *= *\"[^\"]*\"/serial = \"$1\"/" config.toml && rm -f config.toml.bak
-  log "phone moved $TCP -> $1; restarting the engine"
+  log "phone Wi-Fi address $TCP -> $1"
   TCP="$1"
-  if command -v systemctl >/dev/null; then sudo -n systemctl restart content-engine 2>/dev/null; fi
+}
+
+usb_state() { t adb -s "$HW" get-state 2>&1 | grep -oE "device|unauthorized|offline" | head -1; }
+engine_busy() {  # a job is driving the phone, or someone took over from the dashboard: don't restart adbd
+  [ "$(sqlite3 engine.db "select count(*) from jobs where status='running'" 2>/dev/null)" != "0" ] && return 0
+  sqlite3 engine.db "select v from state where k='paused'" 2>/dev/null | grep -q true
+}
+wifi_over_usb() {  # cable in, Wi-Fi adb off: turn it back on over the cable
+  local ip
+  ip="$(t adb -s "$HW" shell ip -4 -o addr show wlan0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
+  [ -z "$ip" ] && return 1  # phone not on Wi-Fi
+  if [ "$(port "$ip:5555")" = closed ]; then
+    engine_busy && return 1
+    log "Wi-Fi adb off at $ip: switching it on over USB (adb tcpip 5555)"
+    t adb -s "$HW" tcpip 5555 >/dev/null 2>&1; sleep 5
+    t adb -s "$HW" wait-for-device >/dev/null 2>&1
+  fi
+  t adb connect "$ip:5555" >/dev/null 2>&1
+  is_phone "$ip:5555" && use "$ip:5555"
 }
 
 scan() {  # every host on our IPv4 subnets with port 5555 open that is our phone
@@ -41,14 +63,26 @@ scan() {  # every host on our IPv4 subnets with port 5555 open that is our phone
   done
 }
 
-log "keeper started; phone $(cfg serial), hardware serial $HW"
-misses=0; down=0  # down: when the phone stopped answering (0 = it answers); blips fixed by one reconnect are not logged
+log "keeper started; USB $HW, Wi-Fi $(cfg serial)"
+misses=0; down=0; usb=""; usb_try=0  # down: when the phone stopped answering (0 = it answers); blips fixed by one reconnect are not logged
 back() {  # $1: how it came back
   [ "$down" -gt 0 ] && log "phone back at $TCP after $(( $(date +%s) - down ))s ($1)"
   down=0; misses=0
 }
 while true; do
   TCP="$(cfg serial)"
+  U="$(usb_state)"; U="${U:-missing}"
+  [ "$U" != "$usb" ] && { log "USB: $U$([ "$U" = unauthorized ] && echo ' (approve "Allow USB debugging" on the phone)')"; usb="$U"; }
+  if [ "$U" = device ]; then
+    # the cable works: just keep the Wi-Fi backup up (at most every 2 min; no subnet scans needed)
+    if ! t adb -s "$TCP" get-state 2>/dev/null | grep -q device && [ $(( $(date +%s) - usb_try )) -ge 120 ]; then
+      usb_try=$(date +%s)
+      wifi_over_usb && back "Wi-Fi backup restored over USB"
+    elif t adb -s "$TCP" get-state 2>/dev/null | grep -q device; then
+      back "answered again"
+    fi
+    sleep 15; continue
+  fi
   if ! t adb -s "$TCP" get-state 2>/dev/null | grep -q device; then
     t adb disconnect "$TCP" >/dev/null 2>&1
     if t adb connect "$TCP" 2>/dev/null | grep -q "connected to" && is_phone "$TCP"; then

@@ -42,7 +42,18 @@ from scrcpy_bridge import Mirror
 
 ROOT = Path(__file__).parent
 CFG = tomllib.loads((ROOT / "config.toml").read_text())
-SERIAL = CFG["phone"]["serial"]
+USB = CFG["phone"].get("usb_serial") or CFG["phone"].get("hw_serial", "")  # over the cable: preferred
+
+
+def wifi_addr() -> str:
+    """The Wi-Fi adb address (ip:5555), the fallback. Read fresh: adb_keeper.sh rewrites it when the phone moves."""
+    try:
+        return tomllib.loads((ROOT / "config.toml").read_text())["phone"]["serial"]
+    except Exception:
+        return CFG["phone"]["serial"]
+
+
+SERIAL = USB or CFG["phone"]["serial"]  # the transport in use now; Runner.find_phone() switches it
 DB = ROOT / "engine.db"
 LOGS = ROOT / "logs"
 INBOX = ROOT / CFG["mailbox"]["inbox"]
@@ -393,14 +404,28 @@ class Runner:
         except Exception as ex:
             return f"error {ex}"
 
+    async def find_phone(self) -> str | None:
+        """The phone over the USB cable if it answers there, else over Wi-Fi. Switches SERIAL (jobs, dashboard,
+        live screen) to whichever answers; None when neither does."""
+        global SERIAL
+        wifi = wifi_addr()
+        for s in dict.fromkeys(x for x in (USB, wifi) if x):
+            ok = await self.adb("-s", s, "get-state") == "device"
+            if not ok and ":" in s:
+                await self.adb("connect", s)
+                ok = await self.adb("-s", s, "get-state") == "device"
+            if ok:
+                if s != SERIAL:
+                    print(f"phone: now over {'Wi-Fi' if ':' in s else 'USB'} ({s}), was {SERIAL}", flush=True)
+                    SERIAL = MIRROR.serial = s
+                return s
+        return None
+
     async def check_phone(self) -> bool:
-        ok = await self.adb("-s", SERIAL, "get-state") == "device"
-        if not ok and ":" in SERIAL:
-            await self.adb("connect", SERIAL)
-            ok = await self.adb("-s", SERIAL, "get-state") == "device"
+        ok = await self.find_phone() is not None
         self.phone_ok = ok
         if not ok:
-            alert("phone", f"phone {SERIAL} is not connected over adb")
+            alert("phone", f"phone is not connected over adb (USB {USB or '-'}, Wi-Fi {wifi_addr()})")
         return ok
 
     def pick(self, now: float):
@@ -596,8 +621,11 @@ class Runner:
                         if not self.paused:
                             await self.park()
                         continue
-                elif self.job is None and int(time.time()) % 60 < 5:
-                    await self.check_phone()
+                if self.job is None and int(time.time()) % 60 < 5:
+                    if self.paused:
+                        await self.check_phone()
+                    else:
+                        await self.find_phone()  # idle: keep the dashboard on the live transport (cable back/out)
             except Exception as ex:
                 alert("engine", f"runner error: {ex!r}")
                 self.job = None

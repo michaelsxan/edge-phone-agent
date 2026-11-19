@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -33,7 +34,7 @@ PKGS = {"tiktok": "com.zhiliaoapp.musically", "instagram": "com.instagram.androi
 
 
 def adb(*args: str, timeout: int = 20) -> str:
-    serial = CFG["phone"]["serial"]
+    serial = os.environ.get("PHONE_SERIAL") or CFG["phone"]["serial"]  # the engine passes the live transport
     try:
         return subprocess.run(["adb", "-s", serial, *args], capture_output=True, text=True, timeout=timeout).stdout.strip()
     except subprocess.TimeoutExpired:
@@ -42,7 +43,7 @@ def adb(*args: str, timeout: int = 20) -> str:
 
 def check_phone(problems: list[str], info: dict) -> bool:
     if adb("get-state") != "device":
-        problems.append(f"phone {CFG['phone']['serial']} is not connected over adb")
+        problems.append(f"phone {os.environ.get('PHONE_SERIAL') or CFG['phone']['serial']} is not connected over adb")
         return False
     adb("shell", "input", "keyevent", "KEYCODE_WAKEUP")
     bat = adb("shell", "dumpsys", "battery")
