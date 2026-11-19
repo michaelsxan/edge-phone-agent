@@ -437,7 +437,9 @@ class Runner:
         if job:
             return job, None
         nxt = con.execute("select min(run_at) from jobs where status='waiting' and kind in ('preflight','post','delete','stats')").fetchone()[0]
-        for r in con.execute("select * from jobs where status='waiting' and kind='research' and run_at<=? order by run_at", (now,)):
+        # fetchall: an open read cursor keeps a shared lock, and finish() below writes on another connection
+        for r in con.execute("select * from jobs where status='waiting' and kind='research' and run_at<=? order by run_at",
+                             (now,)).fetchall():
             if r["not_after"] and now > r["not_after"]:
                 self.finish(r["id"], "skipped", error="its time window passed")
                 continue
